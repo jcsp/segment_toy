@@ -1,0 +1,36 @@
+[package]
+name = "segments"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.21.2", features = ["full"] }
+log = "0.4.17"
+env_logger = "0.9.1"
+bincode = {version="2.0.0-rc.2", features=["serde"]}
+num-traits = "0.2.15"
+aws-config = "0.51.0"
+aws-sdk-s3 = "0.21"
+aws-endpoint = "0.51.0"
+http = "0.2.8"
+futures = "0.3.25"
+lazy_static = "1.4.0"
+regex = "1.7.0"
+serde_json = "1.0.88"
+serde = { version = "1.0", features = ["derive"] }
+aws-smithy-http = "0.51.0"
+test-log = "0.2.11"
+crc32c = "0.6.3"
+
+
+[dependencies.redpanda-adl]
+path = "redpanda-adl"
+
+[dependencies.redpanda-records]
+path = "redpanda-records"
+
+[workspace]
+members = [
+    "redpanda-adl",
+    "redpanda-records",
+]
