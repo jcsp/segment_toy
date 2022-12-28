@@ -1,20 +1,14 @@
-use bincode::enc::write::SliceWriter;
-use crc32c::crc32c;
-use log::{debug, error, info};
-use redpanda_adl::from_bytes;
-use redpanda_records::{
-    RecordBatchHeader, RecordBatchHeaderCrcFirst, RecordBatchHeaderCrcSecond, RecordBatchType,
-};
-use serde::ser::Serialize;
+use crate::batch_crc::batch_body_crc;
+use log::{debug, info, trace};
+use redpanda_records::{Record, RecordBatchHeader, RecordBatchType};
 use std::io;
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 
 use crate::varint::VarIntDecoder;
 
 #[derive(Debug)]
 pub enum DumpError {
-    Message(String),
+    _Message(String),
     DecodeError(redpanda_adl::Error),
     IOError(io::Error),
     EOF,
@@ -43,6 +37,144 @@ pub struct BatchBuffer {
     pub bytes: Vec<u8>,
 }
 
+pub struct RecordIter<'a> {
+    /// Which record out of record_count to read next
+    i: usize,
+    /// Which bytes out of buf.bytes to read next
+    n: usize,
+    buf: &'a BatchBuffer,
+}
+
+impl<'a> RecordIter<'a> {
+    fn read_u8(&mut self) -> u8 {
+        let r = self.buf.bytes[self.n];
+        self.n += 1;
+        r
+    }
+
+    fn read_vari64(&mut self) -> i64 {
+        let mut decoder = VarIntDecoder::new();
+        loop {
+            let b = self.read_u8();
+            if decoder.feed(b) {
+                break;
+            }
+        }
+
+        decoder.result()
+    }
+}
+
+impl<'a> ExactSizeIterator for RecordIter<'a> {
+    fn len(&self) -> usize {
+        self.buf.header.record_count as usize - self.i
+    }
+}
+
+impl<'a> Iterator for RecordIter<'a> {
+    type Item = Record<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i >= self.buf.header.record_count as usize {
+            // TODO: an explicit validation step when in scan mode,
+            // so that even if a batch has a valid CRC, we do not assume
+            // that its contents will be valid.
+            assert_eq!(
+                self.n,
+                self.buf.bytes.len(),
+                "Read {}/{} records, {}/{} bytes, header {:?}",
+                self.i,
+                self.buf.header.record_count as usize,
+                self.n,
+                self.buf.bytes.len(),
+                self.buf.header
+            );
+            None
+        } else if self.n >= self.buf.bytes.len() {
+            assert!(
+                false,
+                "Read {}/{} records, {}/{} bytes, header {:?}",
+                self.i,
+                self.buf.header.record_count as usize,
+                self.n,
+                self.buf.bytes.len(),
+                self.buf.header
+            );
+            unreachable!();
+        } else {
+            let len = self.read_vari64();
+            let initial_n = self.n;
+            trace!("Len {:?}", len);
+            let attrs: i8 = self.read_u8() as i8;
+            trace!("Attrs {:x}", attrs);
+            let ts_delta = self.read_vari64() as u32;
+            let offset_delta = self.read_vari64() as u32;
+            trace!("Deltas: {} {}", ts_delta, offset_delta);
+
+            let key_len = self.read_vari64();
+            trace!("key_len: {}", key_len);
+            // key_len may be -1, means skip
+            let key = if key_len >= 0 {
+                self.n += key_len as usize;
+                Some(&self.buf.bytes[self.n - key_len as usize..self.n])
+            } else {
+                None
+            };
+
+            // val_len may be -1, means skip.  We distinguish between a zero
+            // length key and a None key, to simplify testing (so that deserializing
+            // and reserializing a batch gives identical result)
+            let val_len = self.read_vari64();
+            let val = if val_len >= 0 {
+                self.n += val_len as usize;
+                Some(&self.buf.bytes[self.n - val_len as usize..self.n])
+            } else {
+                None
+            };
+            trace!("Key, val: {} {}", key_len, val_len);
+
+            let mut headers: Vec<(&[u8], &[u8])> = vec![];
+            let n_headers = self.read_vari64() as usize;
+            for _header_i in 0..n_headers {
+                let key_len = self.read_vari64() as usize;
+                self.n += key_len;
+                let h_key = &self.buf.bytes[self.n - key_len as usize..self.n];
+
+                let val_len = self.read_vari64() as usize;
+                self.n += val_len;
+                let h_val = &self.buf.bytes[self.n - val_len as usize..self.n];
+                headers.push((h_key, h_val));
+                trace!("Header Key, val: {} {}", key_len, val_len);
+            }
+
+            let record_bytes_read = self.n - initial_n;
+            debug!("Record bytes read {}, len {}", record_bytes_read, len);
+
+            self.i += 1;
+
+            Some(Record {
+                len: len as u32,
+                attrs,
+                ts_delta,
+                offset_delta,
+                key,
+                value: val,
+                headers,
+            })
+        }
+    }
+}
+
+impl BatchBuffer {
+    pub fn iter(&self) -> RecordIter {
+        return RecordIter {
+            n: std::mem::size_of::<RecordBatchHeader>(),
+            i: 0,
+            buf: self,
+        };
+    }
+}
+
 fn hexdump(bytes: &[u8]) -> String {
     let mut output = String::new();
     for b in bytes {
@@ -60,7 +192,7 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
         }
     }
 
-    pub fn get_bytes_read(&self) -> u64 {
+    pub fn _get_bytes_read(&self) -> u64 {
         self.bytes_read
     }
 
@@ -72,11 +204,24 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
         Ok(r)
     }
 
-    async fn read_vari64(&mut self) -> io::Result<(i64, u8)> {
+    async fn take_exact(&mut self, n: usize) -> io::Result<usize> {
+        let start = self.cur_batch_raw.len();
+        for _ in 0..n {
+            self.cur_batch_raw.push(0);
+        }
+        let r = self
+            .inner
+            .read_exact(&mut self.cur_batch_raw[start..start + n])
+            .await?;
+        self.bytes_read += r as u64;
+        Ok(r)
+    }
+
+    async fn _read_vari64(&mut self) -> io::Result<(i64, u8)> {
         let mut decoder = VarIntDecoder::new();
         let mut read_bytes = 0u8;
         loop {
-            let b = self.read_u8().await?;
+            let b = self._read_u8().await?;
             read_bytes += 1;
             if decoder.feed(b) {
                 break;
@@ -87,14 +232,14 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
         Ok((decoder.result(), read_bytes))
     }
 
-    async fn read_u8(&mut self) -> io::Result<u8> {
+    async fn _read_u8(&mut self) -> io::Result<u8> {
         let mut b: [u8; 1] = [0u8; 1];
         let read_sz = self.read_exact(&mut b).await?;
         self.bytes_read += read_sz as u64;
         Ok(b[0])
     }
 
-    async fn read_vec(&mut self, size: usize) -> io::Result<Vec<u8>> {
+    async fn _read_vec(&mut self, size: usize) -> io::Result<Vec<u8>> {
         let mut b: [u8; 4096] = [0u8; 4096];
         let mut result = Vec::<u8>::new();
 
@@ -122,13 +267,15 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
             info!("EOF");
             Err(DumpError::EOF)
         } else {
-            let result: RecordBatchHeader = from_bytes(&header_buf, bincode::config::standard())?;
+            let result: RecordBatchHeader =
+                redpanda_adl::from_bytes(&header_buf, bincode::config::standard())?;
 
-            // Some other code talks about needing to re-encode this stuff big-endian
-            // to calculate header CRCs, but the
+            // Buffer for CRC32C calculation on the header_crc field of a batcn header: little
+            // endian fixed-integer-width encoding of the header, omitting its leading 4 bytes
+            // of CRC.
             let header_crc_bytes = &header_buf[4..];
             let header_crcc = crc32c::crc32c(header_crc_bytes);
-            info!(
+            trace!(
                 "read_batch_header header_crc_bytes({}) {} {}",
                 header_crcc,
                 header_crc_bytes.len(),
@@ -161,97 +308,6 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
             return Err(DumpError::EOF);
         }
 
-        // Calculate CRC, to determine whether this is a real batch, or some trailing
-        // junk at the end of a falloc'd disk segment.
-        const header_crc_bytes_len: usize = 17 + 40;
-        let mut header_crc_bytes: [u8; header_crc_bytes_len] = [0; header_crc_bytes_len];
-        let mut header_crc_fields = RecordBatchHeaderCrcFirst {
-            size_bytes: batch_header.size_bytes,
-            base_offset: batch_header.base_offset,
-            record_batch_type: batch_header.record_batch_type,
-            crc: batch_header.crc,
-        };
-        // let writer = SliceWriter::new(&mut header_crc_bytes);
-        // let mut encoder = bincode::enc::EncoderImpl::new(
-        //     writer,
-        //     bincode::config::standard().with_little_endian(),
-        // );
-        // RecordBatchHeaderCrcFirst::serialize(&header_crc_fields, encoder).unwrap();
-        bincode::encode_into_slice(
-            &header_crc_fields,
-            &mut header_crc_bytes,
-            bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding(),
-        )
-        .unwrap();
-
-        let vecver1 = bincode::encode_to_vec(
-            &header_crc_fields,
-            bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding(),
-        )
-        .unwrap();
-
-        let mut header_crc_fields_two = RecordBatchHeaderCrcSecond {
-            record_batch_attributes: batch_header.record_batch_attributes,
-            last_offset_delta: batch_header.last_offset_delta,
-            first_timestamp: batch_header.first_timestamp,
-            max_timestamp: batch_header.max_timestamp,
-            producer_id: batch_header.producer_id,
-            producer_epoch: batch_header.producer_epoch,
-            base_sequence: batch_header.base_sequence,
-            record_count: batch_header.record_count,
-        };
-
-        let vecver2 = bincode::encode_to_vec(
-            &header_crc_fields_two,
-            bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding(),
-        )
-        .unwrap();
-
-        info!("len1: {}, len2: {}", vecver1.len(), vecver2.len());
-
-        bincode::encode_into_slice(
-            header_crc_fields_two,
-            &mut header_crc_bytes[17..],
-            bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding(),
-        )
-        .unwrap();
-
-        info!(
-            "header_crc_bytes: {}, {}",
-            header_crc_bytes.len(),
-            hexdump(&header_crc_bytes)
-        );
-
-        let mut sum: u32 = 0;
-        for b in header_crc_bytes {
-            sum += b as u32;
-        }
-        debug!("Header sum: {}", sum);
-
-        let header_crc = crc32c::crc32c(&header_crc_bytes);
-        debug!("Header CRC: {}", header_crc);
-
-        const header2_crc_bytes_len: usize = 40;
-        let mut header2_crc_bytes: [u8; header2_crc_bytes_len] = [0; header2_crc_bytes_len];
-        bincode::encode_into_slice(
-            header_crc_fields_two,
-            &mut header2_crc_bytes,
-            bincode::config::standard()
-                .with_big_endian()
-                .with_fixed_int_encoding(),
-        )
-        .unwrap();
-        let mut body_crc32c = crc32c::crc32c(&header2_crc_bytes);
-        debug!("header2 crc: {}", body_crc32c);
-
         // CRC calculation is based on header bytes as they would be encoded by Kafka, not as
         // they are encoded by redpanda.  We must rebuild the header.
 
@@ -260,58 +316,20 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
         // TODO: we must also check for bytes remaining, in case of an incompletely
         // written batch in a disk log.
 
-        // TODO: just skip, and move the decoding to somewhere else where we really
-        // care about reading the records.
-        // For n records within the batch (variable size), consume.
-        for _record_i in 0..batch_header.record_count {
-            let len = self.read_vari64().await?;
-            debug!("Len {:?}", len);
-            let attrs: u8 = self.read_u8().await?;
-            debug!("Attrs {:x}", attrs);
-            let ts_delta = self.read_vari64().await?.0 as u32;
-            let offset_delta = self.read_vari64().await?.0 as u32;
-            debug!("Deltas: {} {}", ts_delta, offset_delta);
-
-            let key_len = self.read_vari64().await?.0;
-            debug!("key_len: {}", key_len);
-            if key_len > 0 {
-                // key_len may be -1, means skip
-                let _key = self.read_vec(key_len as usize).await?;
-            }
-            let val_len = self.read_vari64().await?.0;
-            if val_len > 0 {
-                // val_len may be -1, means skip
-                let _val = self.read_vec(val_len as usize).await?;
-            }
-            debug!("Key, val: {} {}", key_len, val_len);
-
-            let n_headers = self.read_vari64().await?.0 as usize;
-            for _header_i in 0..n_headers {
-                let key_len = self.read_vari64().await?.0 as usize;
-                let _key = self.read_vec(key_len).await?;
-                let val_len = self.read_vari64().await?.0 as usize;
-                let _val = self.read_vec(key_len).await?;
-                debug!("Header Key, val: {} {}", key_len, val_len);
-            }
+        // Skip over the records: they will be consumed via RecordIter if
+        // the caller really wants them.
+        let body_size = batch_header.size_bytes as usize - std::mem::size_of::<RecordBatchHeader>();
+        let r = self.take_exact(body_size).await?;
+        if r != body_size {
+            debug!("Short body read (header {:?})", batch_header);
+            return Err(DumpError::EOF);
         }
 
-        body_crc32c = crc32c::crc32c_append(
-            body_crc32c,
+        let (body_crc32c, _) = batch_body_crc(
+            &batch_header,
             &self.cur_batch_raw[std::mem::size_of::<RecordBatchHeader>()..],
         );
-        debug!(
-            "Body crc: {:08x} (vs {:08x}) (records {})",
-            body_crc32c,
-            batch_header.crc as u32,
-            self.cur_batch_raw.len() - std::mem::size_of::<RecordBatchHeader>()
-        );
-
-        debug!(
-            "Just records crc32c: {:08x}",
-            crc32c::crc32c(&self.cur_batch_raw[std::mem::size_of::<RecordBatchHeader>()..])
-        );
-
-        if (body_crc32c != batch_header.crc) {
+        if body_crc32c != batch_header.crc {
             info!(
                 "Batch CRC mismatch ({:08x} != {:08x})",
                 body_crc32c, batch_header.crc as u32
@@ -322,22 +340,7 @@ impl<T: AsyncReadExt + Unpin> BatchStream<T> {
             return Err(DumpError::EOF);
         }
 
-        if batch_header.header_crc == 3836992428 {
-            let mut f = File::create("/tmp/dump.bin").await.unwrap();
-            f.write(&self.cur_batch_raw[std::mem::size_of::<RecordBatchHeader>()..])
-                .await
-                .unwrap();
-        }
-
         let batch_bytes = std::mem::take(&mut self.cur_batch_raw);
-        if batch_header.header_crc == 3836992428 {
-            info!(
-                "Reading {} bytes ({})",
-                batch_header.size_bytes as usize,
-                batch_bytes.len()
-            );
-        }
-
         Ok(BatchBuffer {
             header: batch_header,
             bytes: batch_bytes,
@@ -351,7 +354,7 @@ mod tests {
     use log::info;
     use std::env;
     use tokio::fs::File;
-    use tokio::io::{AsyncReadExt, BufReader};
+    use tokio::io::BufReader;
 
     #[test_log::test(tokio::test)]
     pub async fn decode_simple() {
@@ -360,14 +363,23 @@ mod tests {
         // A simple segment file with 5 batches, 1 record in each one,
         // written by Redpanda 22.3
         let expect_batches = 5;
+        let expect_records = 5;
         let filename = cargo_path + "/resources/test/test_segment.bin";
 
         let file = File::open(filename).await.unwrap();
-        let file_size = file.metadata().await.unwrap().len();
         let reader = BufReader::new(file);
         let mut stream = BatchStream::new(reader);
 
+        let types: Vec<RecordBatchType> = vec![
+            RecordBatchType::RaftConfig,
+            RecordBatchType::RaftData,
+            RecordBatchType::RaftData,
+            RecordBatchType::RaftData,
+            RecordBatchType::RaftData,
+        ];
+
         let mut count: usize = 0;
+        let mut record_count: usize = 0;
         loop {
             match stream.read_batch_buffer().await {
                 Ok(bb) => {
@@ -376,7 +388,9 @@ mod tests {
                         bb.bytes.len(),
                         bb.header
                     );
+                    assert_eq!(types[count] as i8, bb.header.record_batch_type);
                     count += 1;
+                    record_count += bb.iter().count();
                     assert!(count <= expect_batches);
                 }
                 Err(e) => {
@@ -386,15 +400,17 @@ mod tests {
             }
         }
         assert_eq!(count, expect_batches);
+        assert_eq!(record_count, expect_records);
+        assert_eq!(stream.bytes_read, 929);
     }
 
     #[test_log::test(tokio::test)]
     pub async fn decode_simple_two() {
         let cargo_path = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-        // A simple segment file with 5 batches, 1 record in each one,
-        // written by Redpanda 22.3
+        // Written by Redpanda 22.3
         let expect_batches = 1;
+        let expect_records = 1;
         let filename = cargo_path + "/resources/test/3676-7429-77-1-v1.log.1";
 
         let file = File::open(filename).await.unwrap();
@@ -403,6 +419,7 @@ mod tests {
         let mut stream = BatchStream::new(reader);
 
         let mut count: usize = 0;
+        let mut record_count: usize = 0;
         loop {
             match stream.read_batch_buffer().await {
                 Ok(bb) => {
@@ -413,6 +430,8 @@ mod tests {
                     );
                     count += 1;
                     assert!(count <= expect_batches);
+                    record_count += bb.iter().count();
+                    assert_eq!(bb.header.record_batch_type, RecordBatchType::RaftData as i8);
                 }
                 Err(e) => {
                     info!("Stream complete: {:?}", e);
@@ -422,5 +441,7 @@ mod tests {
         }
 
         assert_eq!(count, expect_batches);
+        assert_eq!(record_count, expect_records);
+        assert_eq!(stream.bytes_read, file_size);
     }
 }

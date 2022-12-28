@@ -1,5 +1,6 @@
 mod batch;
 
 pub use batch::{
-    RecordBatchHeader, RecordBatchHeaderCrcFirst, RecordBatchHeaderCrcSecond, RecordBatchType,
+    Record, RecordBatchHeader, RecordBatchHeaderCrcFirst, RecordBatchHeaderCrcSecond,
+    RecordBatchType, RecordOwned, UnpackedRecordBatchHeader, BATCH_HEADER_BYTES,
 };

@@ -2,8 +2,8 @@ use std;
 use std::array::TryFromSliceError;
 use std::fmt::{self, Display};
 
-use serde::{de, ser};
 use serde::de::StdError;
+use serde::{de, ser};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -17,6 +17,27 @@ pub enum Error {
     EndOfStream,
     // We did not consume the whole stream
     TrailingBytes,
+}
+
+#[derive(Debug)]
+pub enum EncodeError {
+    Message(String),
+}
+
+impl StdError for EncodeError {}
+
+impl ser::Error for EncodeError {
+    fn custom<T: Display>(msg: T) -> Self {
+        EncodeError::Message(msg.to_string())
+    }
+}
+
+impl Display for EncodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            EncodeError::Message(msg) => formatter.write_str(msg),
+        }
+    }
 }
 
 impl StdError for Error {}

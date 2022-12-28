@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::env::Vars;
+use std::fmt::{Display, Formatter};
 
 use bincode::Encode;
 
@@ -20,6 +20,58 @@ pub struct RecordBatchHeader {
     pub producer_epoch: i16,
     pub base_sequence: i32,
     pub record_count: i32,
+}
+
+pub const BATCH_HEADER_BYTES: usize = std::mem::size_of::<RecordBatchHeader>();
+
+#[derive(Serialize, Encode)]
+pub struct UnpackedRecordBatchHeader {
+    // FIXME: this is just an un-packed ersion of RecordbatchHeader
+    // ...and RecordBatchHeader is only packed because it was convenient
+    // to use its size_of.
+    pub header_crc: u32,
+    pub size_bytes: i32,
+    pub base_offset: u64,
+    pub record_batch_type: i8,
+    pub crc: u32,
+
+    pub record_batch_attributes: u16,
+    pub last_offset_delta: i32,
+    pub first_timestamp: u64,
+    pub max_timestamp: u64,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub base_sequence: i32,
+    pub record_count: i32,
+}
+
+impl UnpackedRecordBatchHeader {
+    pub fn from(other: &RecordBatchHeader) -> Self {
+        Self {
+            header_crc: other.header_crc,
+            size_bytes: other.size_bytes,
+            base_offset: other.base_offset,
+            record_batch_type: other.record_batch_type,
+            crc: other.crc,
+            record_batch_attributes: other.record_batch_attributes,
+            last_offset_delta: other.last_offset_delta,
+            first_timestamp: other.first_timestamp,
+            max_timestamp: other.max_timestamp,
+            producer_id: other.producer_id,
+            producer_epoch: other.producer_epoch,
+            base_sequence: other.base_sequence,
+            record_count: other.record_count,
+        }
+    }
+}
+
+impl Display for RecordBatchHeader {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "RecordBatchHeader<o={} s={} t={}",
+            self.base_offset as u64, self.size_bytes as u64, self.record_batch_type
+        ))
+    }
 }
 
 /// For batch header_crc calculation: little-endian encode this
@@ -73,19 +125,45 @@ pub enum RecordBatchType {
     Max = 23,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct RecordHeader {
-    key: Vec<u8>,
-    val: Vec<u8>,
-}
-
 /// Record does not implement Deserialize, its encoding is too quirky to make it worthwhile
 /// to try and cram into a consistent serde encoding style.
-pub struct Record {
-    len: u32,
-    attrs: i8,
-    ts_delta: u32,
-    offset_delta: u32,
-    key: Vec<u8>,
-    value: Vec<u8>,
+/// This structure does not own its key+value: it is expected to be constructred
+/// with references to data inside a record batch.
+pub struct Record<'a> {
+    pub len: u32,
+    pub attrs: i8,
+    pub ts_delta: u32,
+    pub offset_delta: u32,
+    pub key: Option<&'a [u8]>,
+    pub value: Option<&'a [u8]>,
+    pub headers: Vec<(&'a [u8], &'a [u8])>,
+}
+
+impl<'a> Record<'a> {
+    pub fn to_owned(&self) -> RecordOwned {
+        RecordOwned {
+            len: self.len,
+            attrs: self.attrs,
+            ts_delta: self.ts_delta,
+            offset_delta: self.offset_delta,
+            key: self.key.map(|v| Vec::from(v)),
+            value: self.value.map(|v| Vec::from(v)),
+            headers: self
+                .headers
+                .iter()
+                .map(|(k, v)| (Vec::from(*k), Vec::from(*v)))
+                .collect(),
+        }
+    }
+}
+
+// TODO: use Cow<> to unify with Record
+pub struct RecordOwned {
+    pub len: u32,
+    pub attrs: i8,
+    pub ts_delta: u32,
+    pub offset_delta: u32,
+    pub key: Option<Vec<u8>>,
+    pub value: Option<Vec<u8>>,
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
 }

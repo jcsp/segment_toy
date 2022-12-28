@@ -1,6 +1,5 @@
 use crate::batch_reader::BatchBuffer;
 use log::info;
-use redpanda_records::RecordBatchHeader;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
@@ -44,7 +43,7 @@ impl SegmentWriter {
         {
             self.flush_close().await?;
 
-            // Data rewritten always looks like term 1: because we will rewrite segment bounaries
+            // Data rewritten always looks like term 1: because we will rewrite segment boundaries
             // and potentially compact data from different terms in the same segment, we do not
             // even try to preserve original terms.
             let term = 1;
@@ -56,16 +55,6 @@ impl SegmentWriter {
         }
 
         let f: &mut File = self.cur_file.as_mut().unwrap();
-
-        if buffer.header.header_crc == 3836992428 {
-            info!(
-                "Writing {} bytes ({})",
-                buffer.header.size_bytes as usize,
-                buffer.bytes.len()
-            );
-            let mut f = File::create("/tmp/dump3_full.bin").await.unwrap();
-            f.write_all(&buffer.bytes).await.unwrap();
-        }
 
         f.write_all(&buffer.bytes).await?;
         Ok(())
