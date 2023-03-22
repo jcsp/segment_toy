@@ -201,8 +201,6 @@ impl From<serde_json::Error> for BucketReaderError {
     }
 }
 
-st
-
 impl BucketReader {
     pub async fn new(uri: &str, bucket_name: &str) -> Self {
         let resolver = StaticResolver {
