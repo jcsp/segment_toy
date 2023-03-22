@@ -16,6 +16,7 @@ use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
+use xxhash_rust::xxh32::xxh32;
 
 pub struct SegmentObject {
     key: String,
@@ -35,6 +36,7 @@ impl PartitionObjects {
     }
 }
 
+#[derive(Serialize)]
 pub struct Anomalies {
     /// Segment objects not mentioned in their manifest
     pub segments_outside_manifest: Vec<String>,
@@ -53,11 +55,14 @@ pub struct Anomalies {
 
     /// Keys that do not look like any object we expect
     pub unknown_keys: Vec<String>,
+
+    /// Segments referenced by a manifest, which do not exist in the bucket
+    pub missing_segments: Vec<String>,
 }
 
 impl Anomalies {
     pub fn status(&self) -> AnomalyStatus {
-        if !self.malformed_manifests.is_empty() || !self.malformed_topic_manifests.is_empty() {
+        if !self.malformed_manifests.is_empty() || !self.malformed_topic_manifests.is_empty() || !self.missing_segments.is_empty() {
             AnomalyStatus::Corrupt
         } else if !self.segments_outside_manifest.is_empty()
             || !self.ntpr_no_manifest.is_empty()
@@ -117,6 +122,10 @@ impl Anomalies {
             "Topics with segments but no topic manifest",
             &self.ntr_no_topic_manifest,
         ));
+        result.push_str(&Self::report_line(
+            "Segments referenced in manifest but not found",
+            &self.missing_segments,
+        ));
         result.push_str(&Self::report_line("Unexpected keys", &self.unknown_keys));
         result
     }
@@ -141,6 +150,7 @@ impl Anomalies {
             ntpr_no_manifest: HashSet::new(),
             ntr_no_topic_manifest: HashSet::new(),
             unknown_keys: vec![],
+            missing_segments: vec![],
         }
     }
 }
@@ -293,6 +303,37 @@ impl BucketReader {
                             if let None = found {
                                 self.anomalies.segments_outside_manifest.push(o.key.clone());
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ntpr, partition_manifest) in &self.partition_manifests {
+            let mut known_objects: HashSet<String> = HashSet::new();
+            if let Some(segment_objects) = self.partitions.get(&ntpr) {
+                for o in &segment_objects.segment_objects {
+                    known_objects.insert(o.key.clone());
+                }
+            }
+
+            // For all segments in the manifest, check they were found in the bucket
+            warn!(
+                "Checking {} ({} segments)",
+                partition_manifest.ntp(),
+                partition_manifest.segments.as_ref().map_or(0, |s| s.len())
+            );
+            if let Some(manifest_segments) = &partition_manifest.segments {
+                for (segment_short_name, segment) in manifest_segments {
+                    warn!(
+                        "Checking {} {}",
+                        partition_manifest.ntp(),
+                        segment_short_name
+                    );
+                    if let Some(expect_key) = partition_manifest.segment_key(segment) {
+                        warn!("Calculated segment {}", expect_key);
+                        if !known_objects.contains(&expect_key) {
+                            self.anomalies.missing_segments.push(expect_key);
                         }
                     }
                 }
@@ -508,6 +549,50 @@ pub struct PartitionManifest {
     last_uploaded_compacted_offset: Option<u64>,
     start_offset: Option<u64>,
     segments: Option<HashMap<String, PartitionManifestSegment>>,
+}
+
+impl PartitionManifest {
+    pub fn ntp(&self) -> NTP {
+        NTP {
+            namespace: self.namespace.clone(),
+            topic: self.topic.clone(),
+            partition_id: self.partition,
+        }
+    }
+
+    pub fn segment_key(&self, segment: &PartitionManifestSegment) -> Option<String> {
+        let name = match segment.sname_format {
+            1 => {
+                format!("{}-{}-v1.log", segment.base_offset, segment.segment_term)
+            }
+            2 => {
+                format!(
+                    "{}-{}-{}-{}-v1.log",
+                    segment.base_offset,
+                    segment.committed_offset,
+                    segment.size_bytes,
+                    segment.segment_term
+                )
+            }
+            _ => {
+                warn!(
+                    "Unknown segment name format {} on in ntp {}",
+                    segment.sname_format,
+                    self.ntp()
+                );
+                return None;
+            }
+        };
+
+        let path = format!(
+            "{}/{}/{}_{}/{}",
+            self.namespace, self.topic, self.partition, self.revision, name
+        );
+
+        let hash = xxh32(path.as_bytes(), 0);
+
+        Some(format!("{:08x}/{}.{}", hash, path, segment.archiver_term))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

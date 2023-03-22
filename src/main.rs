@@ -13,7 +13,7 @@ mod varint;
 use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::fs::File;
-use tokio::io::{BufReader};
+use tokio::io::BufReader;
 
 use crate::batch_reader::DumpError;
 use crate::bucket_reader::{AnomalyStatus, BucketReader};
@@ -21,6 +21,7 @@ use crate::fundamental::NTPR;
 use crate::ntp_mask::NTPMask;
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
+use serde_json::json;
 
 /// Parser for use with `clap` argument parsing
 pub fn ntpr_mask_parser(input: &str) -> Result<NTPMask, String> {
@@ -47,7 +48,7 @@ enum Commands {
         source: String,
         #[arg(short, long)]
         detail: bool,
-    }
+    },
 }
 
 async fn scan_detail(bucket_reader: BucketReader) {
@@ -89,9 +90,12 @@ async fn scan(cli: &Cli, source: &str, detail: bool) {
                 source,
                 reader.anomalies.report()
             );
+
             failed = true;
         }
     }
+
+    println!("{}", json!(reader.anomalies));
 
     // Detail mode: exhaustive read of all segment contents, down the the record level.
     if detail {

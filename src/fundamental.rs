@@ -1,6 +1,7 @@
+use serde::Serialize;
 use std::fmt;
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize)]
 pub struct NTP {
     pub namespace: String,
     pub topic: String,
@@ -17,7 +18,7 @@ impl fmt::Display for NTP {
 }
 
 /// A Topic, uniquely identified by its revision ID
-#[derive(Eq, PartialEq, Hash, Debug)]
+#[derive(Eq, PartialEq, Hash, Debug, Serialize)]
 pub struct NTR {
     pub namespace: String,
     pub topic: String,
@@ -34,7 +35,7 @@ impl fmt::Display for NTR {
 }
 
 /// A Partition, uniquely identified by its revision ID
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize)]
 pub struct NTPR {
     pub ntp: NTP,
     pub revision_id: u64,
