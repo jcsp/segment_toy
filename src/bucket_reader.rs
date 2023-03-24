@@ -228,7 +228,14 @@ impl BucketReader {
         for (ntpr, partition_objects) in &mut self.partitions {
             let p_manifest_o = self.partition_manifests.get(ntpr);
             if let None = p_manifest_o {
-                self.anomalies.ntpr_no_manifest.insert(ntpr.clone());
+                // The manifest may be missing because we couldn't load it, in which
+                // case that is already tracked in malformed_manifests
+                let manifest_key = PartitionManifest::manifest_key(ntpr);
+                if self.anomalies.malformed_manifests.contains(&manifest_key) {
+                    debug!("Not reporting {} as missing because it's already reported as malformed", ntpr);
+                } else {
+                    self.anomalies.ntpr_no_manifest.insert(ntpr.clone());
+                }
             }
 
             if ntpr.ntp.partition_id == 0 {
@@ -494,6 +501,16 @@ impl PartitionManifest {
             topic: self.topic.clone(),
             partition_id: self.partition,
         }
+    }
+
+    pub fn manifest_key(ntpr: &NTPR) -> String {
+        let path = format!(
+            "{}/{}/{}_{}",
+            ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
+        );
+        let bitmask = 0xf0000000;
+        let hash = xxh32(path.as_bytes(), 0);
+        format!("{:08x}/meta/{}/manifest.json", hash & bitmask, path)
     }
 
     pub fn segment_key(&self, segment: &PartitionManifestSegment) -> Option<String> {
