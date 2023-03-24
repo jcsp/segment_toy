@@ -29,11 +29,21 @@ pub fn ntpr_mask_parser(input: &str) -> Result<NTPMask, String> {
     NTPMask::from_str(input).map_err(|e| e.to_string())
 }
 
+#[derive(clap::ValueEnum, Clone)]
+enum Backend {
+    AWS,
+    GCP,
+    Azure,
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    #[arg(short, long)]
+    backend: Backend,
 
     #[arg(short, long)]
     uri: Option<String>,
@@ -77,9 +87,24 @@ enum Commands {
  * Read-only scan of data, report anomalies, optionally also decode all record batches.
  */
 async fn scan(cli: &Cli, source: &str, detail: bool) {
-    let mut client_builder = object_store::aws::AmazonS3Builder::from_env();
-    client_builder = client_builder.with_bucket_name(source);
-    let client = Arc::new(client_builder.build().unwrap());
+    let client: Arc<dyn object_store::ObjectStore> = match (cli.backend) {
+        Backend::AWS => {
+            let mut client_builder = object_store::aws::AmazonS3Builder::from_env();
+            client_builder = client_builder.with_bucket_name(source);
+            Arc::new(client_builder.build().unwrap())
+        }
+        Backend::GCP => {
+            Arc::new(object_store::gcp::GoogleCloudStorageBuilder::from_env().with_bucket_name(
+                source
+            ).build().unwrap())
+        }
+        Backend::Azure => {
+            let client = object_store::azure::MicrosoftAzureBuilder::from_env().with_container_name(
+                source
+            ).build().unwrap();
+            Arc::new(client)
+        }
+    };
     let mut reader = BucketReader::new(client).await;
     reader.scan().await.unwrap();
 
