@@ -480,8 +480,8 @@ pub struct PartitionManifest {
     partition: u32,
     revision: u32,
     last_offset: u64,
-    insync_offset: u64,
     // Redpanda quirk: optional fields are omitted when manifest is empty.
+    insync_offset: Option<u64>,
     last_uploaded_compacted_offset: Option<u64>,
     start_offset: Option<u64>,
     segments: Option<HashMap<String, PartitionManifestSegment>>,
@@ -581,10 +581,23 @@ mod tests {
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "tiered");
         assert_eq!(manifest.partition, 4);
+        assert_eq!(manifest.insync_offset, Some(15584));
     }
 
     #[test_log::test(tokio::test)]
     async fn test_empty_manifest_decode() {
+        let manifest = read_manifest("/resources/test/manifest_empty.json").await;
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.segments.is_none());
+        assert_eq!(manifest.start_offset, None);
+        assert_eq!(manifest.namespace, "kafka");
+        assert_eq!(manifest.topic, "acme-ticker-cd-s");
+        assert_eq!(manifest.partition, 9);
+        assert_eq!(manifest.insync_offset, Some(40));
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_nocompact_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest_nocompact.json").await;
         assert_eq!(manifest.version, 1);
         assert_eq!(manifest.segments.unwrap().len(), 4);
@@ -592,7 +605,21 @@ mod tests {
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "acme-ticker-d-d");
         assert_eq!(manifest.partition, 15);
+        assert_eq!(manifest.insync_offset, Some(32));
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_short_manifest_decode() {
+        let manifest = read_manifest("/resources/test/manifest_short.json").await;
+        assert_eq!(manifest.version, 1);
+        assert!(manifest.segments.is_none());
+        assert_eq!(manifest.start_offset, None);
+        assert_eq!(manifest.namespace, "kafka");
+        assert_eq!(manifest.topic, "si_test_topic");
+        assert_eq!(manifest.partition, 0);
+        assert_eq!(manifest.insync_offset, None);
+    }
+
 
     async fn read_topic_manifest(path: &str) -> TopicManifest {
         read_json(path).await
