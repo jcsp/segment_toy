@@ -178,6 +178,8 @@ impl From<serde_json::Error> for BucketReaderError {
     }
 }
 
+st
+
 impl BucketReader {
     pub async fn new(client: Arc<dyn ObjectStore>) -> Self {
         Self {
