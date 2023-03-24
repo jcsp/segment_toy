@@ -45,9 +45,6 @@ struct Cli {
     #[arg(short, long)]
     backend: Backend,
 
-    #[arg(short, long)]
-    uri: Option<String>,
-
     #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPMask::match_all())]
     filter: NTPMask,
 }
