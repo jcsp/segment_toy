@@ -80,7 +80,7 @@ pub fn varint_size(v_raw: i64) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use crate::varint::{varint_encode, varint_encode_to, varint_size, VarIntDecoder};
+    use crate::varint::{varint_encode_to, varint_size, VarIntDecoder};
     use log::error;
 
     fn varint_encode(v_raw: i64) -> Vec<u8> {

@@ -1,11 +1,5 @@
-use crate::bucket_reader::BucketReaderError::{GetError, ListError, ParseError};
 use crate::fundamental::{NTP, NTPR, NTR};
-use aws_config;
-use aws_endpoint::{AwsEndpoint, BoxError, CredentialScope, ResolveAwsEndpoint};
-use aws_sdk_s3::error::{GetObjectError, ListObjectsV2Error};
-use aws_sdk_s3::types::SdkError;
-use aws_sdk_s3::{Client, Endpoint, Region};
-use futures::stream::Stream;
+use futures::stream::{BoxStream, Stream};
 use futures::{stream, StreamExt};
 use http::Uri;
 use lazy_static::lazy_static;
@@ -16,7 +10,9 @@ use serde_json;
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 use xxhash_rust::xxh32::xxh32;
+use object_store::{ObjectStore};
 
 pub struct SegmentObject {
     key: String,
@@ -76,9 +72,9 @@ impl Anomalies {
     }
 
     fn report_line<
-        I: Iterator<Item = J> + ExactSizeIterator,
+        I: Iterator<Item=J> + ExactSizeIterator,
         J: std::fmt::Display,
-        T: IntoIterator<IntoIter = I, Item = J>,
+        T: IntoIterator<IntoIter=I, Item=J>,
     >(
         desc: &str,
         coll: T,
@@ -157,73 +153,34 @@ impl Anomalies {
 
 /// Find all the partitions and their segments within a bucket
 pub struct BucketReader {
-    bucket_name: String,
     pub partitions: HashMap<NTPR, PartitionObjects>,
     pub partition_manifests: HashMap<NTPR, PartitionManifest>,
     pub topic_manifests: HashMap<NTR, TopicManifest>,
     pub anomalies: Anomalies,
-    pub client: Client,
-}
-
-#[derive(Debug)]
-struct StaticResolver {
-    uri: Uri,
-}
-
-impl ResolveAwsEndpoint for StaticResolver {
-    fn resolve_endpoint(&self, _region: &Region) -> Result<AwsEndpoint, BoxError> {
-        Ok(AwsEndpoint::new(
-            Endpoint::immutable(self.uri.clone()),
-            CredentialScope::builder().build(),
-        ))
-    }
+    pub client: Arc<dyn ObjectStore>,
 }
 
 #[derive(Debug)]
 pub enum BucketReaderError {
-    ListError(SdkError<ListObjectsV2Error>),
-    GetError(SdkError<GetObjectError>),
-    NetError(aws_smithy_http::byte_stream::Error),
+    ReadError(object_store::Error),
     ParseError(serde_json::Error),
 }
 
-impl From<SdkError<ListObjectsV2Error>> for BucketReaderError {
-    fn from(e: SdkError<ListObjectsV2Error>) -> Self {
-        ListError(e)
-    }
-}
-
-impl From<SdkError<GetObjectError>> for BucketReaderError {
-    fn from(e: SdkError<GetObjectError>) -> Self {
-        GetError(e)
-    }
-}
-
-impl From<aws_smithy_http::byte_stream::Error> for BucketReaderError {
-    fn from(e: aws_smithy_http::byte_stream::Error) -> Self {
-        BucketReaderError::NetError(e)
+impl From<object_store::Error> for BucketReaderError {
+    fn from(e: object_store::Error) -> Self {
+        BucketReaderError::ReadError(e)
     }
 }
 
 impl From<serde_json::Error> for BucketReaderError {
     fn from(e: serde_json::Error) -> Self {
-        ParseError(e)
+        BucketReaderError::ParseError(e)
     }
 }
 
 impl BucketReader {
-    pub async fn new(uri: &str, bucket_name: &str) -> Self {
-        let resolver = StaticResolver {
-            uri: Uri::from_str(uri).unwrap(),
-        };
-        let env_config = aws_config::load_from_env().await;
-        let config = aws_sdk_s3::config::Builder::from(&env_config)
-            .endpoint_resolver(resolver)
-            .build();
-        let client = Client::from_conf(config);
-
+    pub async fn new(client: Arc<dyn ObjectStore>) -> Self {
         Self {
-            bucket_name: String::from(bucket_name),
             partitions: HashMap::new(),
             partition_manifests: HashMap::new(),
             topic_manifests: HashMap::new(),
@@ -240,28 +197,25 @@ impl BucketReader {
         //  - load the manifests first, and only bother storing extra vectors
         //    of segments if those segments aren't in the manifest
         //  - or use a disk-spilling database for all this state.
-        let mut list_stream = self
-            .client
-            .list_objects_v2()
-            .bucket(&self.bucket_name)
-            .into_paginator()
-            .send();
+
+        // Must clone because otherwise we hold immutable reference to `self` while
+        // iterating through list results
+        let client = self.client.clone();
+
+        let mut list_stream = client.list(None).await?;
+
         while let Some(result_r) = list_stream.next().await {
-            let result = result_r?;
-            if let Some(meta) = result.contents {
-                for o in meta {
-                    let key: &String = &o.key.unwrap();
-                    if key.as_str().ends_with("/manifest.json") {
-                        debug!("Parsing partition manifest key {}", key);
-                        self.ingest_manifest(key).await?;
-                    } else if key.as_str().ends_with("/topic_manifest.json") {
-                        debug!("Parsing topic manifest key {}", key);
-                        self.ingest_topic_manifest(key).await?;
-                    } else {
-                        debug!("Parsing segment key {}", key);
-                        self.ingest_segment(key);
-                    }
-                }
+            let o = result_r?;
+            let key = o.location.to_string();
+            if key.ends_with("/manifest.json") {
+                debug!("Parsing partition manifest key {}", key);
+                self.ingest_manifest(&key).await?;
+            } else if key.ends_with("/topic_manifest.json") {
+                debug!("Parsing topic manifest key {}", key);
+                self.ingest_topic_manifest(&key).await?;
+            } else {
+                debug!("Parsing segment key {}", key);
+                self.ingest_segment(&key);
             }
         }
 
@@ -321,15 +275,15 @@ impl BucketReader {
             warn!(
                 "Checking {} ({} segments)",
                 partition_manifest.ntp(),
-                partition_manifest.segments.as_ref().map_or(0, |s| s.len())
-            );
+                partition_manifest.segments.as_ref().map_or(0, | s | s.len())
+                );
             if let Some(manifest_segments) = &partition_manifest.segments {
                 for (segment_short_name, segment) in manifest_segments {
                     warn!(
                         "Checking {} {}",
                         partition_manifest.ntp(),
                         segment_short_name
-                    );
+                        );
                     if let Some(expect_key) = partition_manifest.segment_key(segment) {
                         warn!("Calculated segment {}", expect_key);
                         if !known_objects.contains(&expect_key) {
@@ -355,33 +309,27 @@ impl BucketReader {
         Ok(())
     }
 
-    /// Yield a byte stream for each segment
-    pub fn stream(
-        &self,
-        ntpr: &NTPR,
-    ) -> Pin<Box<dyn Stream<Item = aws_smithy_http::byte_stream::ByteStream> + '_>> {
-        // TODO error handling for parittion DNE
-        let partition_objects = self.partitions.get(ntpr).unwrap();
-        Box::pin(
-            stream::iter(0..partition_objects.segment_objects.len())
-                .then(|i| self.stream_one(&partition_objects.segment_objects[i])),
-        )
-    }
-
-    // TODO: return type should include name of the segment we're streaming, so that
-    // caller can include it in logs.
-    pub async fn stream_one(&self, po: &SegmentObject) -> aws_smithy_http::byte_stream::ByteStream {
-        // TOOD Handle request failure
-        debug!("stream_one: {}", po.key);
-        self.client
-            .get_object()
-            .bucket(&self.bucket_name)
-            .key(po.key.to_string())
-            .send()
-            .await
-            .unwrap()
-            .body
-    }
+// /// Yield a byte stream for each segment
+// pub fn stream(
+//     &self,
+//     ntpr: &NTPR,
+// ) -> Pin<Box<dyn Stream<Item=aws_smithy_http::byte_stream::ByteStream> + '_>> {
+//     // TODO error handling for parittion DNE
+//     let partition_objects = self.partitions.get(ntpr).unwrap();
+//     Box::pin(
+//         stream::iter(0..partition_objects.segment_objects.len())
+//             .then(|i| self.stream_one(&partition_objects.segment_objects[i])),
+//     )
+// }
+//
+// // TODO: return type should include name of the segment we're streaming, so that
+// // caller can include it in logs.
+// pub async fn stream_one(&self, po: &SegmentObject) -> Result<BoxStream<'static,
+//     object_store::Result<bytes::Bytes>>, BucketReaderError> {
+//     // TOOD Handle request failure
+//     debug!("stream_one: {}", po.key);
+//     self.client.get(po.key.into()).await?.into_stream()
+// }
 
     async fn ingest_manifest(&mut self, key: &str) -> Result<(), BucketReaderError> {
         lazy_static! {
@@ -404,15 +352,9 @@ impl BucketReader {
                 revision_id: partition_revision,
             };
             // TODO: I don't really want to surface the error here+now if it's
-            // transient: retry wrapper?  Maybe aws-sdk-s3 already has one?
-            let get_r = self
-                .client
-                .get_object()
-                .bucket(&self.bucket_name)
-                .key(key)
-                .send()
-                .await?;
-            let bytes = get_r.body.collect().await?.into_bytes();
+            // transient: retry wrapper?
+            let path = object_store::path::Path::from(key);
+            let bytes = self.client.get(&path).await?.bytes().await?;
 
             // Note: assuming memory is sufficient for manifests
             debug!("Storing manifest for {} from key {}", ntpr, key);
@@ -441,14 +383,8 @@ impl BucketReader {
             let ns = grps.get(1).unwrap().as_str().to_string();
             let topic = grps.get(2).unwrap().as_str().to_string();
 
-            let get_r = self
-                .client
-                .get_object()
-                .bucket(&self.bucket_name)
-                .key(key)
-                .send()
-                .await?;
-            let bytes = get_r.body.collect().await?.into_bytes();
+            let path = object_store::path::Path::from(key);
+            let bytes = self.client.get(&path).await?.bytes().await?;
             if let Ok(manifest) = serde_json::from_slice::<TopicManifest>(&bytes) {
                 let ntr = NTR {
                     namespace: ns,

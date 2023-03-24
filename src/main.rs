@@ -10,6 +10,7 @@ mod ntp_mask;
 mod segment_writer;
 mod varint;
 
+use std::sync::Arc;
 use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::fs::File;
@@ -35,7 +36,7 @@ struct Cli {
     command: Option<Commands>,
 
     #[arg(short, long)]
-    uri: String,
+    uri: Option<String>,
 
     #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPMask::match_all())]
     filter: NTPMask,
@@ -51,31 +52,35 @@ enum Commands {
     },
 }
 
-async fn scan_detail(bucket_reader: BucketReader) {
-    for (ntpr, _) in &bucket_reader.partitions {
-        let mut data_stream = bucket_reader.stream(ntpr);
-        while let Some(byte_stream) = data_stream.next().await {
-            let mut batch_stream = BatchStream::new(byte_stream.into_async_read());
-            while let Ok(bb) = batch_stream.read_batch_buffer().await {
-                info!("[{}] Batch {}", ntpr, bb.header);
-                for record in bb.iter() {
-                    info!(
-                        "[{}] Record o={} s={}",
-                        ntpr,
-                        bb.header.base_offset + record.offset_delta as u64,
-                        record.len
-                    );
-                }
-            }
-        }
-    }
-}
+// TODO: reinstate scan_detail based on object_store streams
+// async fn scan_detail(bucket_reader: BucketReader) {
+//     for (ntpr, _) in &bucket_reader.partitions {
+//         let mut data_stream = bucket_reader.stream(ntpr);
+//         while let Some(byte_stream) = data_stream.next().await {
+//             let mut batch_stream = BatchStream::new(byte_stream.into_async_read());
+//             while let Ok(bb) = batch_stream.read_batch_buffer().await {
+//                 info!("[{}] Batch {}", ntpr, bb.header);
+//                 for record in bb.iter() {
+//                     info!(
+//                         "[{}] Record o={} s={}",
+//                         ntpr,
+//                         bb.header.base_offset + record.offset_delta as u64,
+//                         record.len
+//                     );
+//                 }
+//             }
+//         }
+//     }
+// }
 
 /**
  * Read-only scan of data, report anomalies, optionally also decode all record batches.
  */
 async fn scan(cli: &Cli, source: &str, detail: bool) {
-    let mut reader = BucketReader::new(&cli.uri, source).await;
+    let mut client_builder = object_store::aws::AmazonS3Builder::from_env();
+    client_builder = client_builder.with_bucket_name(source);
+    let client = Arc::new(client_builder.build().unwrap());
+    let mut reader = BucketReader::new(client).await;
     reader.scan().await.unwrap();
 
     let mut failed = false;
@@ -101,7 +106,9 @@ async fn scan(cli: &Cli, source: &str, detail: bool) {
     if detail {
         // TODO: wire up the batch/record read to consider any EOFs etc as errors
         // when reading from S3, and set failed=true here
-        scan_detail(reader).await
+
+        // TODO: reinstate scan_detail based on object_store streams
+        //scan_detail(reader).await
     }
 
     if failed {
