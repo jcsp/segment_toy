@@ -466,32 +466,52 @@ impl BucketReader {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PartitionManifestSegment {
+    // Mandatory fields: always set, since v22.1.x
     base_offset: u64,
     committed_offset: u64,
-    delta_offset: u64,
-    delta_offset_end: u64,
-    base_timestamp: u64,
-    max_timestamp: u64,
     is_compacted: bool,
     size_bytes: i64,
     archiver_term: u64,
-    segment_term: u64,
-    sname_format: u32,
+
+    // Since v22.1.x, only set if non-default value
+    delta_offset: Option<u64>,
+    base_timestamp: Option<u64>,
+    max_timestamp: Option<u64>,
+    ntp_revision: Option<u64>,
+
+    // Since v22.3.x, only set if != to segment_name_format::v1
+    sname_format: Option<u32>,
+
+    // Since v22.3.x, always set.
+    segment_term: Option<u64>,
+
+    // Since v22.3.x, only set if sname_format==segment_name_format::v2
+    delta_offset_end: Option<u64>,
+}
+
+#[repr(u8)]
+pub enum SegmentNameFormat {
+    V1 = 1,
+    V2 = 2,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PartitionManifest {
+    // Mandatory fields: always set, since v22.1.x
     version: u32,
     namespace: String,
     topic: String,
     partition: u32,
     revision: u32,
     last_offset: u64,
-    // Redpanda quirk: optional fields are omitted when manifest is empty.
+
+    // Since v22.1.x, only Some if collection has length >= 1
+    segments: Option<HashMap<String, PartitionManifestSegment>>,
+
+    // Since v22.3.x, only set if non-default value
     insync_offset: Option<u64>,
     last_uploaded_compacted_offset: Option<u64>,
     start_offset: Option<u64>,
-    segments: Option<HashMap<String, PartitionManifestSegment>>,
 }
 
 impl PartitionManifest {
@@ -514,26 +534,39 @@ impl PartitionManifest {
     }
 
     pub fn segment_key(&self, segment: &PartitionManifestSegment) -> Option<String> {
-        let name = match segment.sname_format {
-            1 => {
-                format!("{}-{}-v1.log", segment.base_offset, segment.segment_term)
+        let sname_format = match segment.sname_format {
+            None => SegmentNameFormat::V1,
+            Some(1) => SegmentNameFormat::V1,
+            Some(2) => SegmentNameFormat::V2,
+            Some(v) => {
+                warn!("Unknown segment name format {}", v);
+                return None;
             }
-            2 => {
+        };
+
+        let segment_term = match segment.segment_term {
+            Some(t) => t,
+            None => {
+                // TODO: if we want to support pre-22.3.x manifests, need to scape segment
+                // term out of the segment's shortname from the manifest, as it isn't in
+                // the segment object
+                warn!("Segment without segment_term set");
+                return None;
+            }
+        };
+
+        let name = match sname_format {
+            SegmentNameFormat::V1 => {
+                format!("{}-{}-v1.log", segment.base_offset, segment_term)
+            }
+            SegmentNameFormat::V2 => {
                 format!(
                     "{}-{}-{}-{}-v1.log",
                     segment.base_offset,
                     segment.committed_offset,
                     segment.size_bytes,
-                    segment.segment_term
+                    segment_term
                 )
-            }
-            _ => {
-                warn!(
-                    "Unknown segment name format {} on in ntp {}",
-                    segment.sname_format,
-                    self.ntp()
-                );
-                return None;
             }
         };
 
@@ -635,6 +668,18 @@ mod tests {
         assert_eq!(manifest.topic, "si_test_topic");
         assert_eq!(manifest.partition, 0);
         assert_eq!(manifest.insync_offset, None);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_no_maxa_timestamp_manifest_decode() {
+        let manifest = read_manifest("/resources/test/manifest_no_max_timestamp.json").await;
+        assert_eq!(manifest.version, 1);
+        assert_eq!(manifest.segments.unwrap().len(), 30);
+        assert_eq!(manifest.start_offset, Some(0));
+        assert_eq!(manifest.namespace, "kafka");
+        assert_eq!(manifest.topic, "panda-topic");
+        assert_eq!(manifest.partition, 0);
+        assert_eq!(manifest.insync_offset, Some(30493));
     }
 
 
