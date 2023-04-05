@@ -493,6 +493,7 @@ pub struct PartitionManifestSegment {
 pub enum SegmentNameFormat {
     V1 = 1,
     V2 = 2,
+    V3 = 3,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -538,6 +539,7 @@ impl PartitionManifest {
             None => SegmentNameFormat::V1,
             Some(1) => SegmentNameFormat::V1,
             Some(2) => SegmentNameFormat::V2,
+            Some(3) => SegmentNameFormat::V3,
             Some(v) => {
                 warn!("Unknown segment name format {}", v);
                 return None;
@@ -560,6 +562,15 @@ impl PartitionManifest {
                 format!("{}-{}-v1.log", segment.base_offset, segment_term)
             }
             SegmentNameFormat::V2 => {
+                format!(
+                    "{}-{}-{}-{}-v1.log",
+                    segment.base_offset,
+                    segment.committed_offset,
+                    segment.size_bytes,
+                    segment_term
+                )
+            }
+            SegmentNameFormat::V3 => {
                 format!(
                     "{}-{}-{}-{}-v1.log",
                     segment.base_offset,
