@@ -279,20 +279,20 @@ impl BucketReader {
             }
 
             // For all segments in the manifest, check they were found in the bucket
-            warn!(
+            debug!(
                 "Checking {} ({} segments)",
                 partition_manifest.ntp(),
                 partition_manifest.segments.as_ref().map_or(0, | s | s.len())
                 );
             if let Some(manifest_segments) = &partition_manifest.segments {
                 for (segment_short_name, segment) in manifest_segments {
-                    warn!(
+                    debug!(
                         "Checking {} {}",
                         partition_manifest.ntp(),
                         segment_short_name
                         );
                     if let Some(expect_key) = partition_manifest.segment_key(segment) {
-                        warn!("Calculated segment {}", expect_key);
+                        debug!("Calculated segment {}", expect_key);
                         if !known_objects.contains(&expect_key) {
                             self.anomalies.missing_segments.push(expect_key);
                         }
