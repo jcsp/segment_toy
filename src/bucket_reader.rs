@@ -286,6 +286,17 @@ impl BucketReader {
                 );
             if let Some(manifest_segments) = &partition_manifest.segments {
                 for (segment_short_name, segment) in manifest_segments {
+                    if let Some(so) = partition_manifest.start_offset {
+                        if segment.committed_offset < so {
+                            debug!(
+                                "Not checking {} {}, it is below start offset",
+                                partition_manifest.ntp(),
+                                segment_short_name
+                                );
+                            continue;
+                        }
+                    }
+
                     debug!(
                         "Checking {} {}",
                         partition_manifest.ntp(),
