@@ -31,8 +31,12 @@ path = "redpanda-adl"
 [dependencies.redpanda-records]
 path = "redpanda-records"
 
+[dependencies.deltafor]
+path = "deltafor"
+
 [workspace]
 members = [
     "redpanda-adl",
     "redpanda-records",
+    "deltafor",
 ]

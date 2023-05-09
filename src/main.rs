@@ -1,5 +1,6 @@
 extern crate redpanda_adl;
 extern crate redpanda_records;
+extern crate deltafor;
 
 mod batch_crc;
 mod batch_reader;
