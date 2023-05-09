@@ -104,7 +104,13 @@ async fn scan(cli: &Cli, source: &str, detail: bool) {
         }
     };
     let mut reader = BucketReader::new(client).await;
-    reader.scan().await.unwrap();
+    match reader.scan().await {
+        Err(e) => {
+            error!("Error scanning bucket: {:?}", e);
+            return;
+        }
+        Ok(_) => {}
+    }
 
     let mut failed = false;
     match reader.anomalies.status() {
