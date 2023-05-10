@@ -11,14 +11,15 @@ mod ntp_mask;
 mod segment_writer;
 mod varint;
 
+use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use futures::StreamExt;
 use log::{error, info, warn};
 use tokio::fs::File;
-use tokio::io::BufReader;
+use tokio::io::{AsyncReadExt, BufReader};
 
 use crate::batch_reader::DumpError;
-use crate::bucket_reader::{AnomalyStatus, BucketReader};
+use crate::bucket_reader::{AnomalyStatus, BucketReader, PartitionManifest};
 use crate::fundamental::NTPR;
 use crate::ntp_mask::NTPMask;
 use batch_reader::BatchStream;
@@ -37,13 +38,23 @@ enum Backend {
     Azure,
 }
 
+impl Display for Backend {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AWS => f.write_str("aws"),
+            GCP => f.write_str("gcp"),
+            Azure => f.write_str("azure")
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
-    #[arg(short, long)]
+    #[arg(short, long, default_value_t = Backend::AWS)]
     backend: Backend,
 
     #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPMask::match_all())]
@@ -57,6 +68,10 @@ enum Commands {
         source: String,
         #[arg(short, long)]
         detail: bool,
+    },
+    DecodePartitionManifest {
+        #[arg(short, long)]
+        path: String,
     },
 }
 
@@ -146,6 +161,15 @@ async fn scan(cli: &Cli, source: &str, detail: bool) {
     }
 }
 
+async fn decode_partition_manifest(cli: &Cli, path: &str) {
+    let mut f = tokio::fs::File::open(path).await.unwrap();
+    let mut buf: Vec<u8> = vec![];
+    f.read_to_end(&mut buf).await.unwrap();
+
+    let manifest = PartitionManifest::from_bytes(bytes::Bytes::from(buf)).unwrap();
+    serde_json::to_writer_pretty(&::std::io::stderr(), &manifest).unwrap();
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -154,6 +178,9 @@ async fn main() {
     match &cli.command {
         Some(Commands::Scan { source, detail }) => {
             scan(&cli, source, *detail).await;
+        }
+        Some(Commands::DecodePartitionManifest { path }) => {
+            decode_partition_manifest(&cli, path).await;
         }
 
         None => {}
