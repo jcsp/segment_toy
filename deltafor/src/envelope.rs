@@ -15,12 +15,26 @@ impl SerdeEnvelope {
         }
     }
 
-    pub fn read(&mut self, reader: &mut dyn io::Read) -> Result<(), io::Error> {
+    fn read_impl(reader: &mut dyn io::Read) -> Result<(u8, u8, u32), io::Error> {
         let mut hdr: [u8; 6] = [0; 6];
-        reader.read_exact(&mut hdr).unwrap();
-        self.version = hdr[0];
-        self.compat_version = hdr[1];
-        self.size = u32::from_le_bytes(hdr[2..6].try_into().unwrap());
+        reader.read_exact(&mut hdr)?;
+        Ok((hdr[0], hdr[1], u32::from_le_bytes(hdr[2..6].try_into().unwrap())))
+    }
+
+    pub fn from(reader: &mut dyn io::Read) -> Result<Self, io::Error> {
+        let (version, compat_version, size) = Self::read_impl(reader)?;
+        Ok(Self {
+            version,
+            compat_version,
+            size,
+        })
+    }
+
+    pub fn read(&mut self, reader: &mut dyn io::Read) -> Result<(), io::Error> {
+        let (version, compat_version, size) = Self::read_impl(reader)?;
+        self.version = version;
+        self.compat_version = compat_version;
+        self.size = size;
         Ok(())
     }
 }

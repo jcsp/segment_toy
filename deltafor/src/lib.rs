@@ -2,8 +2,8 @@ use serde::Serialize;
 use std::io;
 use std::io::{Error, ErrorKind};
 
-mod bitpack;
-mod envelope;
+pub mod bitpack;
+pub mod envelope;
 
 // The trait is implemented only for i64 since in redpanda we're only
 // using DeltaFOR with this type.
