@@ -7,9 +7,11 @@ mod batch_reader;
 mod batch_writer;
 mod bucket_reader;
 mod fundamental;
+mod remote_types;
 mod ntp_mask;
 mod segment_writer;
 mod varint;
+mod error;
 
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -19,7 +21,8 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, BufReader};
 
 use crate::batch_reader::DumpError;
-use crate::bucket_reader::{AnomalyStatus, BucketReader, PartitionManifest};
+use crate::bucket_reader::{AnomalyStatus, BucketReader};
+use crate::remote_types::{PartitionManifest};
 use crate::fundamental::NTPR;
 use crate::ntp_mask::NTPMask;
 use batch_reader::BatchStream;
@@ -41,9 +44,9 @@ enum Backend {
 impl Display for Backend {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            AWS => f.write_str("aws"),
-            GCP => f.write_str("gcp"),
-            Azure => f.write_str("azure")
+            Backend::AWS => f.write_str("aws"),
+            Backend::GCP => f.write_str("gcp"),
+            Backend::Azure => f.write_str("azure")
         }
     }
 }

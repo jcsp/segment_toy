@@ -1,4 +1,5 @@
 use std::io;
+use std::marker::PhantomData;
 
 pub struct SerdeEnvelope {
     pub version: u8,
@@ -36,6 +37,42 @@ impl SerdeEnvelope {
         self.compat_version = compat_version;
         self.size = size;
         Ok(())
+    }
+}
+
+
+pub struct SerdeEnvelopeContext<'a, T> {
+    pub envelope: SerdeEnvelope,
+    start_position: u64,
+    phantom: PhantomData<&'a T>,
+}
+
+/// When decoding, it is useful to remember the cursor position where we started
+/// reading an envelope body, and later validate that we consumed the expected
+/// number of bytes.
+impl<'a, T: AsRef<[u8]>> SerdeEnvelopeContext<'a, T> {
+    pub fn from(my_version: u8, mut cursor: &mut std::io::Cursor<T>) -> Result<Self,
+        io::Error> {
+        let envelope = SerdeEnvelope::from(&mut cursor)?;
+        assert!(envelope.compat_version <= my_version);
+        Ok(SerdeEnvelopeContext {
+            envelope,
+            start_position: cursor.position(),
+            phantom: PhantomData,
+        })
+    }
+
+    pub fn end(&self, cursor: &std::io::Cursor<T>) {
+        let expect_end = self.start_position + self.envelope.size as u64;
+        if cursor.position() > expect_end {
+            assert!(false, "Read too many bytes");
+        } else {
+            let trailing_bytes = expect_end - cursor.position();
+            // TODO: something cleaner, currently we just assume that this
+            // binary is always fully up to date on formats and therefore
+            // should never have trailing bytes;
+            assert_eq!(trailing_bytes, 0);
+        }
     }
 }
 
