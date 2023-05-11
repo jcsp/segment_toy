@@ -287,7 +287,7 @@ pub struct PartitionManifest {
     // Since v22.1.x, only Some if collection has length >= 1
     pub segments: Option<HashMap<String, PartitionManifestSegment>>,
 
-    // TODO: represent `replaced`
+    pub replaced: Option<Vec<LwSegment>>,
 
     // Since v22.3.x, only set if non-default value
     pub insync_offset: Option<u64>,
@@ -370,6 +370,7 @@ pub trait RpSerde {
         Self: Sized;
 }
 
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LwSegment {
     pub ntp_revision: u64,
     pub base_offset: u64,
@@ -440,8 +441,7 @@ impl PartitionManifest {
 
         let segments = decode_colstore(segments_serialized)?;
 
-        // TODO: add to struct
-        let _replaced = read_vec::<LwSegment>(&mut reader)?;
+        let replaced = read_vec::<LwSegment>(&mut reader)?;
 
         let last_offset = read_u64(&mut reader)?;
         let start_offset = read_u64(&mut reader)?;
@@ -463,6 +463,7 @@ impl PartitionManifest {
             revision,
             last_offset,
             segments: Some(segments),
+            replaced: Some(replaced),
             insync_offset: Some(insync_offset),
             last_uploaded_compacted_offset: Some(last_uploaded_compacted_offset),
             start_offset: Some(start_offset),
