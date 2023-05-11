@@ -1,10 +1,10 @@
 use crate::error::BucketReaderError;
-use crate::fundamental::{NTP, NTPR, NTR};
+use crate::fundamental::{NTP, NTPR};
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
-use log::{debug, info, warn};
+use log::warn;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use xxhash_rust::xxh32::xxh32;
 
@@ -221,7 +221,7 @@ pub fn decode_colstore(
     let segment_term: ColumnReader<DeltaXor> = ColumnReader::from(&mut cursor)?;
     let delta_offset_end: ColumnReader<DeltaXor> = ColumnReader::from(&mut cursor)?;
     let sname_format: ColumnReader<DeltaXor> = ColumnReader::from(&mut cursor)?;
-    let metadata_size_hint: ColumnReader<DeltaXor> = ColumnReader::from(&mut cursor)?;
+    let _metadata_size_hint: ColumnReader<DeltaXor> = ColumnReader::from(&mut cursor)?;
 
     let hint_map_size = read_u32(&mut cursor)?;
     for _hint_i in 0..hint_map_size {
@@ -321,12 +321,6 @@ fn read_u32(cursor: &mut dyn std::io::Read) -> Result<u32, BucketReaderError> {
     Ok(u32::from_le_bytes(raw))
 }
 
-fn read_u8(cursor: &mut dyn std::io::Read) -> Result<u8, BucketReaderError> {
-    let mut raw: [u8; 1] = [0; 1];
-    cursor.read_exact(&mut raw)?;
-    Ok(raw[0])
-}
-
 fn read_bool(cursor: &mut dyn std::io::Read) -> Result<bool, BucketReaderError> {
     let mut raw: [u8; 1] = [0; 1];
     cursor.read_exact(&mut raw)?;
@@ -347,9 +341,9 @@ fn read_iobuf(mut cursor: &mut dyn std::io::Read) -> Result<Vec<u8>, BucketReade
 }
 
 pub struct DeltaFORStreamPos<'a, T> {
-    initial: i64,
-    offset: u32,
-    num_rows: u32,
+    _initial: i64,
+    _offset: u32,
+    _num_rows: u32,
     phantom: PhantomData<&'a T>,
 }
 
@@ -362,9 +356,9 @@ impl<'a, T: AsRef<[u8]>> DeltaFORStreamPos<'a, T> {
         let num_rows = read_u32(&mut cursor)?;
         envelope.end(&cursor);
         Ok(Self {
-            initial,
-            offset,
-            num_rows,
+            _initial: initial,
+            _offset: offset,
+            _num_rows: num_rows,
             phantom: PhantomData,
         })
     }
@@ -446,19 +440,20 @@ impl PartitionManifest {
 
         let segments = decode_colstore(segments_serialized)?;
 
-        // partition_manifest::replaced_segments_list _replaced;
-        let replaced = read_vec::<LwSegment>(&mut reader)?;
+        // TODO: add to struct
+        let _replaced = read_vec::<LwSegment>(&mut reader)?;
 
         let last_offset = read_u64(&mut reader)?;
         let start_offset = read_u64(&mut reader)?;
         let last_uploaded_compacted_offset = read_u64(&mut reader)?;
         let insync_offset = read_u64(&mut reader)?;
 
-        let cloud_log_size_bytes = read_u64(&mut reader)?;
-        let archive_start_offset = read_u64(&mut reader)?;
-        let archive_start_offset_delta = read_u64(&mut reader)?;
-        let archive_clean_offset = read_u64(&mut reader)?;
-        let start_kafka_offset = read_u64(&mut reader)?;
+        // TODO: add to struct
+        let _cloud_log_size_bytes = read_u64(&mut reader)?;
+        let _archive_start_offset = read_u64(&mut reader)?;
+        let _archive_start_offset_delta = read_u64(&mut reader)?;
+        let _archive_clean_offset = read_u64(&mut reader)?;
+        let _start_kafka_offset = read_u64(&mut reader)?;
 
         Ok(PartitionManifest {
             version: envelope.version as u32,

@@ -1,16 +1,17 @@
+use crate::error::BucketReaderError;
 use crate::fundamental::{NTP, NTPR, NTR};
+use crate::remote_types::{ArchivePartitionManifest, PartitionManifest, TopicManifest};
 use futures::stream::{BoxStream, Stream};
 use futures::{stream, StreamExt};
 use lazy_static::lazy_static;
 use log::{debug, warn};
+use object_store::{GetResult, ObjectStore};
 use regex::Regex;
-use serde::{Serialize};
+use serde::Serialize;
 use serde_json;
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
 use std::sync::Arc;
-use object_store::{ObjectStore};
-use crate::remote_types::{PartitionManifest, TopicManifest, ArchivePartitionManifest};
-use crate::error::BucketReaderError;
 
 pub struct SegmentObject {
     key: String,
@@ -59,7 +60,10 @@ pub struct Anomalies {
 
 impl Anomalies {
     pub fn status(&self) -> AnomalyStatus {
-        if !self.malformed_manifests.is_empty() || !self.malformed_topic_manifests.is_empty() || !self.missing_segments.is_empty() {
+        if !self.malformed_manifests.is_empty()
+            || !self.malformed_topic_manifests.is_empty()
+            || !self.missing_segments.is_empty()
+        {
             AnomalyStatus::Corrupt
         } else if !self.segments_outside_manifest.is_empty()
             || !self.ntpr_no_manifest.is_empty()
@@ -73,9 +77,9 @@ impl Anomalies {
     }
 
     fn report_line<
-        I: Iterator<Item=J> + ExactSizeIterator,
+        I: Iterator<Item = J> + ExactSizeIterator,
         J: std::fmt::Display,
-        T: IntoIterator<IntoIter=I, Item=J>,
+        T: IntoIterator<IntoIter = I, Item = J>,
     >(
         desc: &str,
         coll: T,
@@ -163,7 +167,6 @@ pub struct PartitionMetadata {
     // the head manifest.
     head_manifest: Option<PartitionManifest>,
     archive_manifests: Vec<ArchivePartitionManifest>,
-
 }
 
 impl PartitionMetadata {
@@ -194,6 +197,9 @@ pub struct BucketReader {
     pub anomalies: Anomalies,
     pub client: Arc<dyn ObjectStore>,
 }
+
+type SegmentStream = BoxStream<'static, object_store::Result<bytes::Bytes>>;
+type SegmentStreamResult = Result<SegmentStream, BucketReaderError>;
 
 impl BucketReader {
     pub async fn new(client: Arc<dyn ObjectStore>) -> Self {
@@ -301,7 +307,9 @@ impl BucketReader {
                     // No head manifest: this is a partition for which we found archive
                     // manifests but no head manifest.
                     for am in &partition_metadata.archive_manifests {
-                        self.anomalies.archive_manifests_outside_manifest.push(am.key(ntpr))
+                        self.anomalies
+                            .archive_manifests_outside_manifest
+                            .push(am.key(ntpr))
                     }
                     continue;
                 }
@@ -309,28 +317,28 @@ impl BucketReader {
 
             // For all segments in the manifest, check they were found in the bucket
             debug!(
-    "Checking {} ({} segments)",
-    partition_manifest.ntp(),
-    partition_manifest.segments.as_ref().map_or(0, | s | s.len())
-    );
+                "Checking {} ({} segments)",
+                partition_manifest.ntp(),
+                partition_manifest.segments.as_ref().map_or(0, |s| s.len())
+            );
             if let Some(manifest_segments) = &partition_manifest.segments {
                 for (segment_short_name, segment) in manifest_segments {
                     if let Some(so) = partition_manifest.start_offset {
                         if segment.committed_offset < so {
                             debug!(
-    "Not checking {} {}, it is below start offset",
-    partition_manifest.ntp(),
-    segment_short_name
-    );
+                                "Not checking {} {}, it is below start offset",
+                                partition_manifest.ntp(),
+                                segment_short_name
+                            );
                             continue;
                         }
                     }
 
                     debug!(
-    "Checking {} {}",
-    partition_manifest.ntp(),
-    segment_short_name
-    );
+                        "Checking {} {}",
+                        partition_manifest.ntp(),
+                        segment_short_name
+                    );
                     if let Some(expect_key) = partition_manifest.segment_key(segment) {
                         debug!("Calculated segment {}", expect_key);
                         if !known_objects.contains(&expect_key) {
@@ -356,29 +364,42 @@ impl BucketReader {
         Ok(())
     }
 
-// /// Yield a byte stream for each segment
-// pub fn stream(
-//     &self,
-//     ntpr: &NTPR,
-// ) -> Pin<Box<dyn Stream<Item=aws_smithy_http::byte_stream::ByteStream> + '_>> {
-//     // TODO error handling for parittion DNE
-//     let partition_objects = self.partitions.get(ntpr).unwrap();
-//     Box::pin(
-//         stream::iter(0..partition_objects.segment_objects.len())
-//             .then(|i| self.stream_one(&partition_objects.segment_objects[i])),
-//     )
-// }
-//
-// // TODO: return type should include name of the segment we're streaming, so that
-// // caller can include it in logs.
-// pub async fn stream_one(&self, po: &SegmentObject) -> Result<BoxStream<'static,
-//     object_store::Result<bytes::Bytes>>, BucketReaderError> {
-//     // TOOD Handle request failure
-//     debug!("stream_one: {}", po.key);
-//     self.client.get(po.key.into()).await?.into_stream()
-// }
+    /// Yield a byte stream for each segment
+    pub fn stream(
+        &self,
+        ntpr: &NTPR,
+        //) -> Pin<Box<dyn Stream<Item = Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, BucketReaderError> + '_>>
+    ) -> Pin<Box<dyn Stream<Item = SegmentStreamResult> + '_>> {
+        // TODO error handling for parittion DNE
 
-    fn decode_partition_manifest(key: &str, buf: bytes::Bytes) -> Result<PartitionManifest, BucketReaderError> {
+        // TODO go via metadata: if we have no manifest, we should synthesize one and validate
+        // rather than just stepping throuhg objects naively.
+        let partition_objects = self.partitions.get(ntpr).unwrap();
+        Box::pin(
+            stream::iter(0..partition_objects.segment_objects.len())
+                .then(|i| self.stream_one(&partition_objects.segment_objects[i])),
+        )
+    }
+
+    // TODO: return type should include name of the segment we're streaming, so that
+    // caller can include it in logs.
+    pub async fn stream_one(&self, po: &SegmentObject) -> Result<SegmentStream, BucketReaderError> {
+        // TOOD Handle request failure
+        debug!("stream_one: {}", po.key);
+        let key: &str = &po.key;
+        let path = object_store::path::Path::from(key);
+        let get_result = self.client.get(&path).await?;
+        match get_result {
+            // This code is currently only for use with object storage
+            GetResult::File(_, _) => unreachable!(),
+            GetResult::Stream(s) => Ok(s),
+        }
+    }
+
+    fn decode_partition_manifest(
+        key: &str,
+        buf: bytes::Bytes,
+    ) -> Result<PartitionManifest, BucketReaderError> {
         if key.ends_with(".json") || key.contains(".json_") {
             Ok(serde_json::from_slice(&buf)?)
         } else if key.ends_with(".bin") || key.contains(".bin_") {
@@ -391,7 +412,8 @@ impl BucketReader {
     async fn ingest_manifest(&mut self, key: &str) -> Result<(), BucketReaderError> {
         lazy_static! {
             static ref PARTITION_MANIFEST_KEY: Regex =
-                Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/manifest.(json|bin)").unwrap();
+                Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/manifest.(json|bin)")
+                    .unwrap();
         }
         if let Some(grps) = PARTITION_MANIFEST_KEY.captures(key) {
             // Group::get calls are safe to unwrap() because regex always has those groups if it matched
@@ -428,10 +450,13 @@ impl BucketReader {
                     meta.head_manifest = Some(manifest);
                 }
                 None => {
-                    self.partition_manifests.insert(ntpr, PartitionMetadata {
-                        head_manifest: Some(manifest),
-                        archive_manifests: vec![],
-                    });
+                    self.partition_manifests.insert(
+                        ntpr,
+                        PartitionMetadata {
+                            head_manifest: Some(manifest),
+                            archive_manifests: vec![],
+                        },
+                    );
                 }
             }
         } else {
@@ -503,10 +528,13 @@ impl BucketReader {
                     meta.archive_manifests.push(archive_manifest);
                 }
                 None => {
-                    self.partition_manifests.insert(ntpr, PartitionMetadata {
-                        head_manifest: None,
-                        archive_manifests: vec![archive_manifest],
-                    });
+                    self.partition_manifests.insert(
+                        ntpr,
+                        PartitionMetadata {
+                            head_manifest: None,
+                            archive_manifests: vec![archive_manifest],
+                        },
+                    );
                 }
             }
         } else {
@@ -599,4 +627,3 @@ impl BucketReader {
         }
     }
 }
-

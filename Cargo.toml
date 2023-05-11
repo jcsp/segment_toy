@@ -24,6 +24,15 @@ xxhash-rust = { version = "0.8.6", features = ["xxh32"] }
 object_store = { version = "0.5.5", features = ["aws", "azure", "gcp"] }
 bytes = "1.4.0"
 
+[[bin]]
+name = "rp-storage-tool"
+path = "src/main.rs"
+
+# Build unstable/experimental bits into a separate binary, so that the primary binary
+# is safely usable in production environments without risking running "the wrong subcommand"
+[[bin]]
+name = "rp-storage-tool-unstable"
+path = "src/main_unstable.rs"
 
 [dependencies.redpanda-adl]
 path = "redpanda-adl"

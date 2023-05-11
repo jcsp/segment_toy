@@ -1,8 +1,10 @@
-# Engineering Storage Tool
+# Redpanda Engineering Storage Tool
 
 ## Purpose
 
-This tool is for offline use by Redpanda Engineering.
+This low level tool is for offline use by Redpanda Engineering.
+
+This tool is **not** for everyday use on live clusters.
 
 ## Quickstart
 
