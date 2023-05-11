@@ -510,7 +510,7 @@ fn _unpack32(xs: &mut [u64; 16], shift: u32, buf: &mut dyn io::Read) -> Result<(
         let mut bytes = Vec::<u8>::new();
         bytes.resize(4, 0);
         buf.read_exact(bytes.as_mut_slice())?;
-        xs[i] |= (u32::from_le_bytes(bytes.as_slice().try_into().unwrap()) << shift) as u64;
+        xs[i] |= (u32::from_le_bytes(bytes.as_slice().try_into().unwrap()) as u64) << shift;
     }
     Ok(())
 }
@@ -520,7 +520,7 @@ fn _unpack16(xs: &mut [u64; 16], shift: u32, buf: &mut dyn io::Read) -> Result<(
         let mut bytes = Vec::<u8>::new();
         bytes.resize(2, 0);
         buf.read_exact(bytes.as_mut_slice())?;
-        xs[i] |= (u16::from_le_bytes(bytes.as_slice().try_into().unwrap()) << shift) as u64;
+        xs[i] |= (u16::from_le_bytes(bytes.as_slice().try_into().unwrap()) as u64) << shift;
     }
     Ok(())
 }
@@ -530,7 +530,7 @@ fn _unpack8(xs: &mut [u64; 16], shift: u32, buf: &mut dyn io::Read) -> Result<()
         let mut bytes = Vec::<u8>::new();
         bytes.resize(1, 0);
         buf.read_exact(bytes.as_mut_slice())?;
-        xs[i] |= (u8::from_le_bytes(bytes.as_slice().try_into().unwrap()) << shift) as u64;
+        xs[i] |= (u8::from_le_bytes(bytes.as_slice().try_into().unwrap()) as u64) << shift;
     }
     Ok(())
 }
@@ -693,6 +693,7 @@ fn _unpack7(xs: &mut [u64; 16], shift: u32, buf: &mut dyn io::Read) -> Result<()
 }
 
 pub fn unpack(output: &mut [u64; 16], num_bits: u32, buf: &mut dyn io::Read) -> Result<(), Error> {
+    eprintln!("unpack: {}", num_bits);
     match num_bits {
         0 => Ok(()),
         1 => _unpack1(output, 0, buf),
