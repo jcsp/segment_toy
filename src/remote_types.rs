@@ -718,4 +718,22 @@ mod tests {
         assert_eq!(manifest.revision, 8);
         assert_eq!(manifest.segments.unwrap().len(), 3654);
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_binary_manifest_decode_2() {
+        // This is an exampe of a manifest that happesn to have values large enough
+        // to trigger a previously-fixed bug in the deltafor code.
+        let b = read_bytes("/resources/test/manifest_23_2_binary_2.bin").await;
+
+        let manifest = PartitionManifest::from_bytes(b).unwrap();
+        assert_eq!(manifest.namespace, "kafka");
+        assert_eq!(manifest.topic, "topic-lppzmjltwl");
+        assert_eq!(manifest.partition, 5);
+        assert_eq!(manifest.revision, 51);
+
+        // Reproducer for issue with DeltaFOR decode
+        let segments = manifest.segments.unwrap();
+        assert_eq!(segments.len(), 97);
+        assert_eq!(segments.get("1225-1-v1.log").unwrap().size_bytes, 1573496)
+    }
 }
