@@ -16,14 +16,14 @@ use tokio::io::AsyncReadExt;
 
 use crate::bucket_reader::{AnomalyStatus, BucketReader};
 use crate::fundamental::NTPR;
-use crate::ntp_mask::NTPMask;
+use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
 use clap::{Parser, Subcommand};
 use serde_json::json;
 
 /// Parser for use with `clap` argument parsing
-pub fn ntpr_mask_parser(input: &str) -> Result<NTPMask, String> {
-    NTPMask::from_str(input).map_err(|e| e.to_string())
+pub fn ntp_filter_parser(input: &str) -> Result<NTPFilter, String> {
+    NTPFilter::from_str(input).map_err(|e| e.to_string())
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -52,8 +52,8 @@ struct Cli {
     #[arg(short, long, default_value_t = Backend::AWS)]
     backend: Backend,
 
-    #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPMask::match_all())]
-    filter: NTPMask,
+    #[arg(short, long, value_parser = ntp_filter_parser, default_value_t = NTPFilter::match_all())]
+    filter: NTPFilter,
 }
 
 #[derive(Subcommand)]
@@ -93,7 +93,7 @@ async fn scan(cli: &Cli, source: &str) {
         }
     };
     let mut reader = BucketReader::new(client).await;
-    match reader.scan().await {
+    match reader.scan(&cli.filter).await {
         Err(e) => {
             error!("Error scanning bucket: {:?}", e);
             return;

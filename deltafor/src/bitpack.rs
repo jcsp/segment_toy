@@ -693,7 +693,6 @@ fn _unpack7(xs: &mut [u64; 16], shift: u32, buf: &mut dyn io::Read) -> Result<()
 }
 
 pub fn unpack(output: &mut [u64; 16], num_bits: u32, buf: &mut dyn io::Read) -> Result<(), Error> {
-    eprintln!("unpack: {}", num_bits);
     match num_bits {
         0 => Ok(()),
         1 => _unpack1(output, 0, buf),

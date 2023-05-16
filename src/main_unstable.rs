@@ -14,7 +14,8 @@ mod segment_writer;
 mod varint;
 
 use crate::segment_writer::SegmentWriter;
-use futures::StreamExt;
+use bytes::Bytes;
+use futures::{pin_mut, StreamExt};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -25,17 +26,20 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use crate::batch_reader::DumpError;
 use crate::batch_writer::reserialize_batch;
 use crate::bucket_reader::{AnomalyStatus, BucketReader};
-use crate::fundamental::NTPR;
-use crate::ntp_mask::NTPMask;
+use crate::error::BucketReaderError;
+use crate::fundamental::{RawOffset, Timestamp, NTPR};
+use crate::ntp_mask::NTPFilter;
+use crate::remote_types::{PartitionManifest, PartitionManifestSegment, SegmentNameFormat};
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
-use redpanda_records::RecordOwned;
+use object_store::ObjectStore;
+use redpanda_records::{RecordBatchType, RecordOwned};
 use serde_json::json;
 use tokio_util::io::StreamReader;
 
 /// Parser for use with `clap` argument parsing
-pub fn ntpr_mask_parser(input: &str) -> Result<NTPMask, String> {
-    NTPMask::from_str(input).map_err(|e| e.to_string())
+pub fn ntpr_mask_parser(input: &str) -> Result<NTPFilter, String> {
+    NTPFilter::from_str(input).map_err(|e| e.to_string())
 }
 
 #[derive(clap::ValueEnum, Clone)]
@@ -64,8 +68,8 @@ struct Cli {
     #[arg(short, long, default_value_t = Backend::AWS)]
     backend: Backend,
 
-    #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPMask::match_all())]
-    filter: NTPMask,
+    #[arg(short, long, value_parser = ntpr_mask_parser, default_value_t = NTPFilter::match_all())]
+    filter: NTPFilter,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +85,8 @@ enum Commands {
         source: String,
         #[arg(short, long)]
         detail: bool,
+        #[arg(short, long)]
+        out_file: Option<String>,
     },
     Scrub {
         #[arg(short, long)]
@@ -90,11 +96,304 @@ enum Commands {
         #[arg(short, long)]
         source: String,
     },
+    RebuildManifest {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        sink: String,
+        #[arg(short, long)]
+        meta_file: Option<String>,
+    },
+    Extract {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        sink: String,
+        #[arg(short, long)]
+        meta_file: Option<String>,
+    },
+}
+
+async fn rebuild_manifest(
+    cli: &Cli,
+    source: &str,
+    sink: &str,
+    meta_file: Option<&str>,
+) -> Result<(), BucketReaderError> {
+    info!("Loading metadata from {}...", sink);
+
+    let bucket_reader = make_bucket_reader(cli, source, meta_file).await;
+
+    for (ntpr, partition_objects) in &bucket_reader.partitions {
+        if !cli.filter.match_ntpr(&ntpr) {
+            continue;
+        }
+        info!("Rebuilding manifest for partition {}", ntpr);
+
+        // TODO: implement binary encoding
+        let manifest_path = PartitionManifest::manifest_key(&ntpr, "json");
+
+        // TODO: if PartitionObjects has an ambiguous dropped objects, now is the time to
+        // try and validate/true-up the content.
+
+        // Initially assume that at the start of the partition kafka offset == raw offset:
+        // we cannot know any better from the raw segment data.  Later, we will adjust deltas
+        // if we have an existing partition manifest that can tell us about the delta.
+        let mut offset_delta: i64 = 0;
+
+        // Build a manifest
+        let mut manifest = PartitionManifest::new(ntpr.clone());
+        for (_base_offset, segment) in &partition_objects.segment_objects {
+            // Stream of Bytes chunks of data in the segment
+            let segment_chunk_stream = bucket_reader.stream_one(&segment.key).await?;
+
+            // Stream of bytes in the segment
+            let segment_byte_stream = StreamReader::new(segment_chunk_stream);
+
+            // Stream of batches in the segment
+            let mut batch_stream = BatchStream::new(segment_byte_stream);
+
+            let mut min_offset: Option<RawOffset> = None;
+            let mut max_offset: Option<RawOffset> = None;
+            let mut min_ts: Option<Timestamp> = None;
+            let mut max_ts: Option<Timestamp> = None;
+            let mut compacted: bool = false;
+
+            let base_offset_delta = offset_delta;
+
+            while let Ok(batch) = batch_stream.read_batch_buffer().await {
+                let base_offset: RawOffset = batch.header.base_offset as RawOffset;
+                let committed_offset: RawOffset = batch.header.base_offset as RawOffset
+                    + batch.header.last_offset_delta as RawOffset;
+
+                // TODO: behavior on overlapping segments: when we see a batch that is <=
+                // the highest batch already seen, we should either be dropping this segment,
+                // or truncating the previous segment, or consulting `dropped_objects_ambiguous`
+
+                // TODO; rules for other data types like Tx batches
+                let is_data = batch.header.record_batch_type == RecordBatchType::RaftData as i8;
+
+                debug!(
+                    "Seg {:012x}-... Batch data={:?} {:012x}-{:012x}",
+                    segment.base_offset, is_data, base_offset, committed_offset
+                );
+
+                if let Some(max_offset) = max_offset {
+                    if batch.header.base_offset as i64 != max_offset + 1 {
+                        // If we see a gap between batches, infer that this segment was compacted.
+                        compacted = true;
+                        // TODO: also set compacted if we see a gap between records: currently
+                        // not doing this because we don't have ability to read inside
+                        // compressed batches
+                    }
+                }
+
+                if !is_data {
+                    offset_delta += batch.header.record_count as i64;
+                }
+
+                let batch_max_ts = batch.header.max_timestamp as Timestamp;
+                if min_ts.is_none() {
+                    min_ts = Some(batch.header.first_timestamp as Timestamp);
+                }
+                if max_ts.is_none() || max_ts.unwrap() < batch_max_ts {
+                    max_ts = Some(batch_max_ts);
+                }
+
+                if min_offset.is_none() {
+                    min_offset = Some(base_offset);
+                }
+                if max_offset.is_none() || max_offset.unwrap() < committed_offset {
+                    max_offset = Some(committed_offset);
+                }
+            }
+
+            // TODO: validate behavior if last batch is a config batch: this is a sensitive
+            // area in the logic for deltas
+            let next_offset_delta = offset_delta;
+
+            let pms = PartitionManifestSegment {
+                base_offset: min_offset.unwrap() as u64,
+                committed_offset: max_offset.unwrap() as u64,
+                is_compacted: compacted,
+                // TODO: cross ref segment's declared size with HEAD of object and sum of
+                // batch sizes, and warn on discrepancies
+                size_bytes: segment.size_bytes as i64,
+                archiver_term: segment.upload_term as u64,
+                delta_offset: Some(base_offset_delta as u64),
+                base_timestamp: Some(min_ts.unwrap() as u64),
+                max_timestamp: Some(max_ts.unwrap() as u64),
+                ntp_revision: Some(ntpr.revision_id as u64),
+                sname_format: Some(SegmentNameFormat::V3 as u32),
+                segment_term: Some(segment.original_term as u64),
+                delta_offset_end: Some(next_offset_delta as u64),
+            };
+
+            manifest.push(pms);
+        }
+
+        // If an original manifest is present, use it to correct our offset deltas: there
+        // is no way to recover these from the raw segments alone.
+        if let Some(pm) = bucket_reader.partition_manifests.get(ntpr) {
+            if let Some(original_manifest) = &pm.head_manifest {
+                info!(
+                    "Trying to infer offset delta for {} from existing manifest...",
+                    ntpr
+                );
+                if let Some(original_segments) = &original_manifest.segments {
+                    let mut original_segments: Vec<&PartitionManifestSegment> = original_segments
+                        .values()
+                        .filter(|s| s.delta_offset.is_some())
+                        .collect();
+                    original_segments.sort_by_key(|s| s.base_offset);
+
+                    let hint_segment = original_segments.get(0).unwrap();
+                    let delta_hint = (hint_segment.base_offset, hint_segment.delta_offset.unwrap());
+
+                    let mut delta_adjustment: Option<i64> = None;
+                    for segment in manifest.segments.as_ref().unwrap().values() {
+                        if segment.base_offset == delta_hint.0 {
+                            delta_adjustment =
+                                Some(delta_hint.1 as i64 - segment.delta_offset.unwrap() as i64);
+                            info!(
+                                "Discovered partition {} delta {}",
+                                ntpr,
+                                delta_adjustment.unwrap()
+                            );
+                            break;
+                        }
+                    }
+
+                    if let Some(delta_adjustment) = delta_adjustment {
+                        for segment in manifest.segments.as_mut().unwrap().values_mut() {
+                            *(segment.delta_offset.as_mut().unwrap()) += delta_adjustment as u64;
+                            *(segment.delta_offset_end.as_mut().unwrap()) +=
+                                delta_adjustment as u64;
+                        }
+                    }
+                }
+            }
+        }
+
+        // TODO: generalized URI-ish things so that callers can use object stores as sinks
+        let sink_client = object_store::local::LocalFileSystem::new_with_prefix(sink)?;
+
+        // Serialize manifest to sink
+        let manifest_json = serde_json::to_vec_pretty(&manifest).unwrap();
+
+        info!(
+            "Rebuilt manifest for partition {} at {}",
+            ntpr, manifest_path
+        );
+
+        // TODO: option to output V1 JSON manifests for fixing 23.1 and 22.3 clusters
+
+        // Write manifest to sink bucket
+        sink_client
+            .put(
+                &object_store::path::Path::from(manifest_path),
+                Bytes::from(manifest_json),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn make_bucket_reader(cli: &Cli, source: &str, meta_file: Option<&str>) -> BucketReader {
+    let client = build_client(cli, source);
+    if let Some(path) = meta_file {
+        info!("Loading metadata from {}", path);
+        BucketReader::from_file(path, client).await.unwrap()
+    } else {
+        info!("Scanning bucket...");
+        let mut reader = BucketReader::new(client).await;
+        reader.scan(&cli.filter).await.unwrap();
+        reader
+    }
+}
+
+async fn extract(
+    cli: &Cli,
+    source: &str,
+    sink: &str,
+    meta_file: Option<&str>,
+) -> Result<(), BucketReaderError> {
+    // If metadata was loaded from a file, it might not be filtered
+    // in a way that lines up with cli.filter: re-filter so that one
+    // can have a monolithic metadata file but extract individual partitions
+    // on demand
+    let bucket_reader = make_bucket_reader(cli, source, meta_file).await;
+
+    // TODO: generalized URI-ish things so that callers can use object stores as sinks
+    let sink_client = object_store::local::LocalFileSystem::new_with_prefix(sink)?;
+
+    for (ntpr, _objects) in bucket_reader.partitions.iter() {
+        if !cli.filter.match_ntpr(ntpr) {
+            continue;
+        } else {
+            info!("extract match: {}", ntpr);
+        }
+
+        let manifest_paths: Vec<object_store::path::Path> = vec!["bin", "json"]
+            .iter()
+            .map(|e| PartitionManifest::manifest_key(&ntpr, e))
+            .map(|s| object_store::path::Path::from(s))
+            .collect();
+
+        for path in &manifest_paths {
+            debug!("Trying to download manifest {}", path);
+            match bucket_reader.client.get(path).await {
+                Ok(get_result) => {
+                    let bytes = get_result.bytes().await?;
+                    sink_client.put(path, bytes).await?;
+                    info!("Downloaded manifest {}", path);
+                }
+                Err(e) => {
+                    match e {
+                        object_store::Error::NotFound { path: _, source: _ } => {
+                            // Normal that one or other of the manifest paths is missing
+                            debug!("Didn't fetch {}: {}", path, e);
+                        }
+                        _ => {
+                            warn!("Unexpected error fetching {}: {}", path, e);
+                            return Err(e.into());
+                        }
+                    }
+                }
+            };
+        }
+    }
+
+    for (ntpr, objects) in bucket_reader.partitions.iter() {
+        if !cli.filter.match_ntpr(ntpr) {
+            continue;
+        } else {
+            info!("extract match: {}", ntpr);
+        }
+
+        for key in objects.all_keys() {
+            info!("Copying {}", key);
+            // TODO; make bucket reader return an object_store::Error?
+            let mut stream = bucket_reader.stream_one(&key).await.unwrap();
+
+            let (_, mut sink_stream) = sink_client
+                .put_multipart(&object_store::path::Path::from(key.as_str()))
+                .await?;
+
+            while let Some(chunk) = stream.next().await {
+                sink_stream.write(chunk.unwrap().as_ref()).await?;
+            }
+            sink_stream.shutdown().await?;
+        }
+    }
+    Ok(())
 }
 
 async fn scan_detail(bucket_reader: BucketReader) {
     for (ntpr, _) in &bucket_reader.partitions {
-        let mut data_stream = bucket_reader.stream(ntpr);
+        let data_stream = bucket_reader.stream(ntpr);
+        pin_mut!(data_stream);
         while let Some(segment_stream) = data_stream.next().await {
             let segment_stream_data = segment_stream.unwrap();
             let byte_stream = StreamReader::new(segment_stream_data);
@@ -122,7 +421,7 @@ async fn scan_detail(bucket_reader: BucketReader) {
 async fn scrub(cli: &Cli, source: &str) {
     let client = build_client(cli, source);
     let mut reader = BucketReader::new(client).await;
-    reader.scan().await.unwrap();
+    reader.scan(&cli.filter).await.unwrap();
 
     // TODO: drop out if there are any anomalies _other than_ segments outside the manifest
 
@@ -165,7 +464,7 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
     let client = build_client(cli, source);
 
     let mut reader = BucketReader::new(client).await;
-    reader.scan().await.unwrap();
+    reader.scan(&cli.filter).await.unwrap();
 
     match reader.anomalies.status() {
         AnomalyStatus::Clean => {
@@ -202,7 +501,8 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
         let mut writer = SegmentWriter::new(1024 * 1024, dir);
 
         info!("Reading partition {:?}", ntpr);
-        let mut data_stream = reader.stream(ntpr);
+        let data_stream = reader.stream(ntpr);
+        pin_mut!(data_stream);
         while let Some(segment_stream) = data_stream.next().await {
             let byte_stream = StreamReader::new(segment_stream.unwrap());
             let mut batch_stream = BatchStream::new(byte_stream);
@@ -223,13 +523,13 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
 async fn compact(cli: &Cli, source: &str) {
     let client = build_client(cli, source);
     let mut reader = BucketReader::new(client).await;
-    reader.scan().await.unwrap();
+    reader.scan(&cli.filter).await.unwrap();
 
     // TODO: generalize the "stop if corrupt" check and apply it here, as we do in rewrite
 
     for (ntpr, _) in &reader.partitions {
         // TODO: inspect topic manifest to see if it is meant to be compacted.
-        if !cli.filter.compare(ntpr) {
+        if !cli.filter.match_ntpr(ntpr) {
             debug!("Skipping {}, doesn't match NTPR mask", ntpr);
             continue;
         }
@@ -243,7 +543,8 @@ async fn compact(cli: &Cli, source: &str) {
         let mut writer = SegmentWriter::new(1024 * 1024, dir);
 
         info!("Reading partition {:?}", ntpr);
-        let mut data_stream = reader.stream(ntpr);
+        let data_stream = reader.stream(ntpr);
+        pin_mut!(data_stream);
         while let Some(segment_stream) = data_stream.next().await {
             info!("Compacting segment...");
             let mut dropped_count: u64 = 0;
@@ -329,16 +630,20 @@ fn build_client(cli: &Cli, bucket: &str) -> Arc<dyn object_store::ObjectStore> {
 /**
  * Read-only scan of data, report anomalies, optionally also decode all record batches.
  */
-async fn scan(cli: &Cli, source: &str, detail: bool) {
+async fn scan(cli: &Cli, source: &str, detail: bool, out_file: Option<&str>) {
     let client = build_client(cli, source);
 
     let mut reader = BucketReader::new(client).await;
-    match reader.scan().await {
+    match reader.scan(&cli.filter).await {
         Err(e) => {
             error!("Error scanning bucket: {:?}", e);
             return;
         }
         Ok(_) => {}
+    }
+
+    if let Some(out_file) = out_file {
+        reader.to_file(out_file).await.unwrap();
     }
 
     let mut failed = false;
@@ -384,8 +689,14 @@ async fn main() {
         Some(Commands::Rewrite { source, force }) => {
             rewrite(&cli, source, *force).await;
         }
-        Some(Commands::Scan { source, detail }) => {
-            scan(&cli, source, *detail).await;
+        Some(Commands::Scan {
+            source,
+            detail,
+            out_file,
+        }) => {
+            // let out_file_str = out_file.clone();
+            // let out_file = out_file_str.as_ref().map(|s| s.as_str());
+            scan(&cli, source, *detail, out_file.as_ref().map(|s| s.as_str())).await;
         }
         Some(Commands::Scrub { source }) => {
             scrub(&cli, source).await;
@@ -393,6 +704,20 @@ async fn main() {
         Some(Commands::Compact { source }) => {
             compact(&cli, source).await;
         }
+        Some(Commands::RebuildManifest {
+            source,
+            sink,
+            meta_file,
+        }) => rebuild_manifest(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str()))
+            .await
+            .unwrap(),
+        Some(Commands::Extract {
+            source,
+            sink,
+            meta_file,
+        }) => extract(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str()))
+            .await
+            .unwrap(),
 
         None => {}
     }

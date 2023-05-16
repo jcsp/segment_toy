@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 use xxhash_rust::xxh32::xxh32;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionManifestSegment {
     // Mandatory fields: always set, since v22.1.x
     pub base_offset: u64,
@@ -281,7 +281,14 @@ pub enum SegmentNameFormat {
     V3 = 3,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum PartitionManifestFormat {
+    V1 = 1,
+    // >=23.2 serde-enabled format
+    V2 = 2,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionManifest {
     // Mandatory fields: always set, since v22.1.x
     pub version: u32, // This field is explicit in JSON, in serde it is the envelope version
@@ -388,7 +395,7 @@ pub trait RpSerde {
         Self: Sized;
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LwSegment {
     pub ntp_revision: u64,
     pub base_offset: i64,
@@ -417,7 +424,7 @@ impl RpSerde for LwSegment {
             archiver_term,
             segment_term,
             size_bytes,
-            sname_format
+            sname_format,
         })
 
         // TODO: respect envelope + skip any unread bytes
@@ -435,6 +442,72 @@ fn read_vec<T: RpSerde>(mut cursor: &mut dyn std::io::Read) -> Result<Vec<T>, Bu
 }
 
 impl PartitionManifest {
+    pub fn new(ntpr: NTPR) -> Self {
+        // This initial state is not meant to be a valid manifest: we expect at least one
+        // segment insertion to properly initialize offsets.
+        Self {
+            version: PartitionManifestFormat::V2 as u32,
+            namespace: ntpr.ntp.namespace,
+            topic: ntpr.ntp.topic,
+            partition: ntpr.ntp.partition_id,
+            revision: ntpr.revision_id,
+            last_offset: 0,
+            segments: Some(HashMap::new()),
+            insync_offset: None,
+            last_uploaded_compacted_offset: Some(i64::MIN),
+            start_offset: None,
+            replaced: Some(HashMap::new()),
+            cloud_log_size_bytes: Some(0),
+            archive_start_offset: Some(i64::MIN),
+            archive_start_offset_delta: Some(i64::MIN),
+            archive_clean_offset: Some(i64::MIN),
+        }
+    }
+
+    pub fn push(&mut self, segment: PartitionManifestSegment) {
+        let shortname = segment_shortname(
+            segment.base_offset as i64,
+            segment.segment_term.unwrap() as i64,
+        );
+
+        fn opt_max(a: &mut Option<i64>, b: i64) {
+            match a {
+                Some(v) => *v = b.max(*v),
+                None => *a = Some(b),
+            }
+        }
+
+        self.last_offset = self.last_offset.max(segment.committed_offset as i64);
+        opt_max(&mut self.insync_offset, segment.committed_offset as i64);
+        if segment.is_compacted {
+            opt_max(
+                &mut self.last_uploaded_compacted_offset,
+                segment.committed_offset as i64,
+            );
+        }
+
+        if self.start_offset.is_none() {
+            self.start_offset = Some(segment.base_offset as i64);
+        }
+
+        if self.cloud_log_size_bytes.is_none() {
+            self.cloud_log_size_bytes = Some(segment.size_bytes as u64);
+        } else {
+            *(self.cloud_log_size_bytes.as_mut().unwrap()) += segment.size_bytes as u64;
+        }
+
+        // Method should only be used on manifest constructed with new()
+        assert!(self.segments.is_some());
+
+        let segments = self.segments.as_mut().unwrap();
+        let replaced = segments.insert(shortname, segment);
+
+        // Caller is responsible for managing any colliding segments, if they are
+        // passed into this function then the result would be a corrupt manifest.
+        // TODO: a nice LogicalError error type instead of an assertion
+        assert!(replaced.is_none());
+    }
+
     pub fn contains_segment_shortname(&self, short_name: &str) -> bool {
         if let Some(segs) = &self.segments {
             segs.contains_key(short_name)
@@ -501,43 +574,7 @@ impl PartitionManifest {
 
         // TODO: respect envelope + skip any unread bytes
     }
-}
 
-/// Metadata spilled from the head partition manifest: this includes a full manifest of
-/// its own, plus additional fields that are encoded in the key
-pub struct ArchivePartitionManifest {
-    pub manifest: PartitionManifest,
-    pub base_offset: u64,
-    pub committed_offset: u64,
-    pub base_kafka_offset: u64,
-    pub next_kafka_offset: u64,
-    pub base_ts: u64,
-    pub last_ts: u64,
-}
-
-impl ArchivePartitionManifest {
-    pub fn key(&self, ntpr: &NTPR) -> String {
-        let path = format!(
-            "{}/{}/{}_{}",
-            ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
-        );
-        let bitmask = 0xf0000000;
-        let hash = xxh32(path.as_bytes(), 0);
-        format!(
-            "{:08x}/meta/{}/manifest.json_{}_{}_{}_{}_{}_{}",
-            hash & bitmask,
-            path,
-            self.base_offset,
-            self.committed_offset,
-            self.base_kafka_offset,
-            self.next_kafka_offset,
-            self.base_ts,
-            self.last_ts
-        )
-    }
-}
-
-impl PartitionManifest {
     pub fn ntp(&self) -> NTP {
         NTP {
             namespace: self.namespace.clone(),
@@ -546,16 +583,20 @@ impl PartitionManifest {
         }
     }
 
-    pub fn manifest_key(ntpr: &NTPR) -> String {
+    pub fn manifest_key(ntpr: &NTPR, extension: &str) -> String {
         let path = format!(
             "{}/{}/{}_{}",
             ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
         );
         let bitmask = 0xf0000000;
         let hash = xxh32(path.as_bytes(), 0);
-        format!("{:08x}/meta/{}/manifest.json", hash & bitmask, path)
+        format!(
+            "{:08x}/meta/{}/manifest.{}",
+            hash & bitmask,
+            path,
+            extension
+        )
     }
-
     pub fn segment_key(&self, segment: &PartitionManifestSegment) -> Option<String> {
         let sname_format = match segment.sname_format {
             None => SegmentNameFormat::V1,
@@ -608,7 +649,42 @@ impl PartitionManifest {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Metadata spilled from the head partition manifest: this includes a full manifest of
+/// its own, plus additional fields that are encoded in the key
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ArchivePartitionManifest {
+    pub manifest: PartitionManifest,
+    pub base_offset: u64,
+    pub committed_offset: u64,
+    pub base_kafka_offset: u64,
+    pub next_kafka_offset: u64,
+    pub base_ts: u64,
+    pub last_ts: u64,
+}
+
+impl ArchivePartitionManifest {
+    pub fn key(&self, ntpr: &NTPR) -> String {
+        let path = format!(
+            "{}/{}/{}_{}",
+            ntpr.ntp.namespace, ntpr.ntp.topic, ntpr.ntp.partition_id, ntpr.revision_id
+        );
+        let bitmask = 0xf0000000;
+        let hash = xxh32(path.as_bytes(), 0);
+        format!(
+            "{:08x}/meta/{}/manifest.json_{}_{}_{}_{}_{}_{}",
+            hash & bitmask,
+            path,
+            self.base_offset,
+            self.committed_offset,
+            self.base_kafka_offset,
+            self.next_kafka_offset,
+            self.base_ts,
+            self.last_ts
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TopicManifest {
     pub version: u32,
     pub namespace: String,
@@ -785,7 +861,9 @@ mod tests {
         assert_eq!(manifest.cloud_log_size_bytes, Some(225998141));
         assert_eq!(manifest.start_offset, Some(0));
         assert_eq!(manifest.last_offset, 7017);
-        assert_eq!(manifest.last_uploaded_compacted_offset, Some(-9223372036854775808));
-
+        assert_eq!(
+            manifest.last_uploaded_compacted_offset,
+            Some(-9223372036854775808)
+        );
     }
 }
