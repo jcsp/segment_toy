@@ -100,7 +100,7 @@ pub struct RecordBatchHeaderCrcSecond {
 #[repr(i8)]
 #[derive(Copy, Clone, Serialize, Deserialize, Debug)]
 pub enum RecordBatchType {
-    RaftData = 0x1,
+    RaftData = 0x1i8,
     RaftConfig = 0x2,
     Controller = 3,
     KVStore = 4,

@@ -70,6 +70,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-stream"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd56dd203fef61ac097dd65721a419ddccb106b2d2b70ba60a6b529f03961a51"
+dependencies = [
+ "async-stream-impl",
+ "futures-core",
+ "pin-project-lite",
+]
+
+[[package]]
+name = "async-stream-impl"
+version = "0.3.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16e62a023e7c117e27523144c5d2459f4397fcc3cab0085af8e2224f643a0193"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.15",
+]
+
+[[package]]
 name = "async-trait"
 version = "0.1.68"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -832,15 +854,16 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.5.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec9cd6ca25e796a49fa242876d1c4de36a24a6da5258e9f0bc062dbf5e81c53b"
+version = "0.6.0"
+source = "git+https://github.com/jcsp/arrow-rs.git?rev=96e62d8f#96e62d8f41f1ac46a8050f835f9b0c2413c9945d"
 dependencies = [
  "async-trait",
  "base64",
  "bytes",
  "chrono",
  "futures",
+ "humantime",
+ "hyper",
  "itertools",
  "parking_lot",
  "percent-encoding",
@@ -1153,6 +1176,7 @@ dependencies = [
 name = "segments"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "aws-smithy-http",
  "bincode",
  "bytes",
@@ -1166,6 +1190,7 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
+ "pin-utils",
  "redpanda-adl",
  "redpanda-records",
  "regex",
@@ -1173,6 +1198,7 @@ dependencies = [
  "serde_json",
  "test-log",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "xxhash-rust",
 ]
@@ -1416,6 +1442,17 @@ dependencies = [
  "rustls",
  "tokio",
  "webpki",
+]
+
+[[package]]
+name = "tokio-stream"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "397c988d37662c7dda6d2208364a706264bf3d6138b11d436cbac0ad38832842"
+dependencies = [
+ "futures-core",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
