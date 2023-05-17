@@ -38,6 +38,13 @@ struct ColumnReader<A: DeltaAlg + 'static> {
     marker: PhantomData<&'static A>,
 }
 
+/// Legagcy manifest JSON format stores segments in maps where the key
+/// is derived from the segment using this mapping.  This is equivalent
+/// to SegmentNameFormat::V1
+fn segment_shortname(base_offset: i64, segment_term: i64) -> String {
+    format!("{}-{}-v1.log", base_offset, segment_term)
+}
+
 impl<A: DeltaAlg> ColumnReader<A> {
     /// May panic: caller is responsible for ensuring index is within bounds
     pub fn get(&self, i: usize) -> i64 {
@@ -243,7 +250,7 @@ pub fn decode_colstore(
     for i in 0..is_compacted.values.len() {
         let seg_base_offset = base_offset.get(i);
         let seg_segment_term = segment_term.get(i);
-        let shortname = format!("{}-{}-v1.log", seg_base_offset, seg_segment_term);
+        let shortname = segment_shortname(seg_base_offset, seg_segment_term);
 
         segment_map.insert(
             shortname,
@@ -277,7 +284,7 @@ pub enum SegmentNameFormat {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PartitionManifest {
     // Mandatory fields: always set, since v22.1.x
-    pub version: u32,
+    pub version: u32, // This field is explicit in JSON, in serde it is the envelope version
     pub namespace: String,
     pub topic: String,
     pub partition: u32,
@@ -285,14 +292,25 @@ pub struct PartitionManifest {
     pub last_offset: u64,
 
     // Since v22.1.x, only Some if collection has length >= 1
+    // `segments` is logically a vector, but stored as a map for convenient conversion with
+    // legacy JSON encoding which uses a map.
     pub segments: Option<HashMap<String, PartitionManifestSegment>>,
 
-    pub replaced: Option<Vec<LwSegment>>,
-
-    // Since v22.3.x, only set if non-default value
+    // >> Since v22.3.x, only set if non-default value
     pub insync_offset: Option<u64>,
     pub last_uploaded_compacted_offset: Option<u64>,
     pub start_offset: Option<u64>,
+    // `replaced` is logically a vector, but stored as a map for convenient conversion with
+    // legacy JSON encoding which uses a map.
+    pub replaced: Option<HashMap<String, LwSegment>>, // When decoding JSON, this is only set if non-empty
+    // << Since v22.3.x
+
+    // >> Since v23.2.x, in manifest format v2
+    pub cloud_log_size_bytes: Option<u64>,
+    pub archive_start_offset: Option<u64>,
+    pub archive_start_offset_delta: Option<u64>,
+    pub archive_clean_offset: Option<u64>,
+    // << Since v23.2.x
 }
 
 fn read_string(mut cursor: &mut dyn std::io::Read) -> Result<String, BucketReaderError> {
@@ -373,10 +391,10 @@ pub trait RpSerde {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct LwSegment {
     pub ntp_revision: u64,
-    pub base_offset: u64,
+    pub base_offset: i64,
     pub committed_offset: u64,
     pub archiver_term: u64,
-    pub segment_term: u64,
+    pub segment_term: i64,
     pub size_bytes: u64,
 }
 
@@ -384,10 +402,10 @@ impl RpSerde for LwSegment {
     fn from_bytes(mut cursor: &mut dyn std::io::Read) -> Result<Self, BucketReaderError> {
         let _envelope = SerdeEnvelope::new().read(&mut cursor)?;
         let ntp_revision = read_u64(&mut cursor)?;
-        let base_offset = read_u64(&mut cursor)?;
+        let base_offset = read_i64(&mut cursor)?;
         let committed_offset = read_u64(&mut cursor)?;
         let archiver_term = read_u64(&mut cursor)?;
-        let segment_term = read_u64(&mut cursor)?;
+        let segment_term = read_i64(&mut cursor)?;
         let size_bytes = read_u64(&mut cursor)?;
 
         Ok(LwSegment {
@@ -424,8 +442,7 @@ impl PartitionManifest {
 
     pub fn from_bytes(bytes: bytes::Bytes) -> Result<Self, BucketReaderError> {
         let mut reader = std::io::Cursor::new(bytes);
-        let mut envelope = SerdeEnvelope::new();
-        envelope.read(&mut reader)?;
+        let envelope = SerdeEnvelope::from(&mut reader)?;
 
         // model::ntp _ntp;
 
@@ -443,16 +460,22 @@ impl PartitionManifest {
 
         let replaced = read_vec::<LwSegment>(&mut reader)?;
 
+        // Convert replaced list to a map, the struct uses a map for convenient encoding to
+        // the legacy manifest v1 JSON format which uses a map.
+        let replaced_map = replaced
+            .into_iter()
+            .map(|seg| (segment_shortname(seg.base_offset, seg.segment_term), seg))
+            .collect();
+
         let last_offset = read_u64(&mut reader)?;
         let start_offset = read_u64(&mut reader)?;
         let last_uploaded_compacted_offset = read_u64(&mut reader)?;
         let insync_offset = read_u64(&mut reader)?;
 
-        // TODO: add to struct
-        let _cloud_log_size_bytes = read_u64(&mut reader)?;
-        let _archive_start_offset = read_u64(&mut reader)?;
-        let _archive_start_offset_delta = read_u64(&mut reader)?;
-        let _archive_clean_offset = read_u64(&mut reader)?;
+        let cloud_log_size_bytes = read_u64(&mut reader)?;
+        let archive_start_offset = read_u64(&mut reader)?;
+        let archive_start_offset_delta = read_u64(&mut reader)?;
+        let archive_clean_offset = read_u64(&mut reader)?;
         let _start_kafka_offset = read_u64(&mut reader)?;
 
         Ok(PartitionManifest {
@@ -463,10 +486,14 @@ impl PartitionManifest {
             revision,
             last_offset,
             segments: Some(segments),
-            replaced: Some(replaced),
+            replaced: Some(replaced_map),
             insync_offset: Some(insync_offset),
             last_uploaded_compacted_offset: Some(last_uploaded_compacted_offset),
             start_offset: Some(start_offset),
+            cloud_log_size_bytes: Some(cloud_log_size_bytes),
+            archive_start_offset: Some(archive_start_offset),
+            archive_start_offset_delta: Some(archive_start_offset_delta),
+            archive_clean_offset: Some(archive_clean_offset),
         })
 
         // TODO: respect envelope + skip any unread bytes
