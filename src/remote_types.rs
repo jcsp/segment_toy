@@ -766,4 +766,26 @@ mod tests {
         assert_eq!(segments.len(), 97);
         assert_eq!(segments.get("1225-1-v1.log").unwrap().size_bytes, 1573496)
     }
+
+    #[test_log::test(tokio::test)]
+    async fn test_manifest_with_replaced_segments() {
+        let b = read_bytes("/resources/test/manifest_with_replaced_segments.bin").await;
+        let manifest = PartitionManifest::from_bytes(b).unwrap();
+        assert_eq!(manifest.version, 2);
+        assert_eq!(manifest.namespace, "kafka");
+        assert_eq!(manifest.topic, "test-topic");
+
+        assert_eq!(manifest.replaced.is_some(), true);
+        let replaced_segs = manifest.replaced.unwrap();
+        assert_eq!(replaced_segs["6756-1-v1.log"].base_offset, 6756);
+        assert_eq!(replaced_segs["6756-1-v1.log"].sname_format, 3);
+        assert_eq!(replaced_segs["6889-1-v1.log"].base_offset, 6889);
+        assert_eq!(replaced_segs["6889-1-v1.log"].sname_format, 3);
+
+        assert_eq!(manifest.cloud_log_size_bytes, Some(225998141));
+        assert_eq!(manifest.start_offset, Some(0));
+        assert_eq!(manifest.last_offset, 7017);
+        assert_eq!(manifest.last_uploaded_compacted_offset, Some(-9223372036854775808));
+
+    }
 }
