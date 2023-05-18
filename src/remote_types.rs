@@ -288,8 +288,8 @@ pub struct PartitionManifest {
     pub namespace: String,
     pub topic: String,
     pub partition: u32,
-    pub revision: u64,
-    pub last_offset: u64,
+    pub revision: i64,
+    pub last_offset: i64,
 
     // Since v22.1.x, only Some if collection has length >= 1
     // `segments` is logically a vector, but stored as a map for convenient conversion with
@@ -297,9 +297,9 @@ pub struct PartitionManifest {
     pub segments: Option<HashMap<String, PartitionManifestSegment>>,
 
     // >> Since v22.3.x, only set if non-default value
-    pub insync_offset: Option<u64>,
-    pub last_uploaded_compacted_offset: Option<u64>,
-    pub start_offset: Option<u64>,
+    pub insync_offset: Option<i64>,
+    pub last_uploaded_compacted_offset: Option<i64>,
+    pub start_offset: Option<i64>,
     // `replaced` is logically a vector, but stored as a map for convenient conversion with
     // legacy JSON encoding which uses a map.
     pub replaced: Option<HashMap<String, LwSegment>>, // When decoding JSON, this is only set if non-empty
@@ -307,9 +307,9 @@ pub struct PartitionManifest {
 
     // >> Since v23.2.x, in manifest format v2
     pub cloud_log_size_bytes: Option<u64>,
-    pub archive_start_offset: Option<u64>,
-    pub archive_start_offset_delta: Option<u64>,
-    pub archive_clean_offset: Option<u64>,
+    pub archive_start_offset: Option<i64>,
+    pub archive_start_offset_delta: Option<i64>,
+    pub archive_clean_offset: Option<i64>,
     // << Since v23.2.x
 }
 
@@ -454,7 +454,7 @@ impl PartitionManifest {
         let partition = read_u32(&mut reader)?;
 
         // model::initial_revision_id _rev;
-        let revision = read_u64(&mut reader)?;
+        let revision = read_i64(&mut reader)?;
 
         // iobuf _segments_serialized;
         let segments_serialized = read_iobuf(&mut reader)?;
@@ -470,16 +470,16 @@ impl PartitionManifest {
             .map(|seg| (segment_shortname(seg.base_offset, seg.segment_term), seg))
             .collect();
 
-        let last_offset = read_u64(&mut reader)?;
-        let start_offset = read_u64(&mut reader)?;
-        let last_uploaded_compacted_offset = read_u64(&mut reader)?;
-        let insync_offset = read_u64(&mut reader)?;
+        let last_offset = read_i64(&mut reader)?;
+        let start_offset = read_i64(&mut reader)?;
+        let last_uploaded_compacted_offset = read_i64(&mut reader)?;
+        let insync_offset = read_i64(&mut reader)?;
 
         let cloud_log_size_bytes = read_u64(&mut reader)?;
-        let archive_start_offset = read_u64(&mut reader)?;
-        let archive_start_offset_delta = read_u64(&mut reader)?;
-        let archive_clean_offset = read_u64(&mut reader)?;
-        let _start_kafka_offset = read_u64(&mut reader)?;
+        let archive_start_offset = read_i64(&mut reader)?;
+        let archive_start_offset_delta = read_i64(&mut reader)?;
+        let archive_clean_offset = read_i64(&mut reader)?;
+        let _start_kafka_offset = read_i64(&mut reader)?;
 
         Ok(PartitionManifest {
             version: envelope.version as u32,
