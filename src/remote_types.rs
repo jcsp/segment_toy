@@ -396,6 +396,7 @@ pub struct LwSegment {
     pub archiver_term: u64,
     pub segment_term: i64,
     pub size_bytes: u64,
+    pub sname_format: u32,
 }
 
 impl RpSerde for LwSegment {
@@ -407,6 +408,7 @@ impl RpSerde for LwSegment {
         let archiver_term = read_u64(&mut cursor)?;
         let segment_term = read_i64(&mut cursor)?;
         let size_bytes = read_u64(&mut cursor)?;
+        let sname_format = read_u32(&mut cursor)?;
 
         Ok(LwSegment {
             ntp_revision,
@@ -415,6 +417,7 @@ impl RpSerde for LwSegment {
             archiver_term,
             segment_term,
             size_bytes,
+            sname_format
         })
 
         // TODO: respect envelope + skip any unread bytes
