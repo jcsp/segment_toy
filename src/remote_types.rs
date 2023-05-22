@@ -297,8 +297,11 @@ pub struct PartitionManifest {
     pub segments: Option<HashMap<String, PartitionManifestSegment>>,
 
     // >> Since v22.3.x, only set if non-default value
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub insync_offset: Option<i64>,
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub last_uploaded_compacted_offset: Option<i64>,
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub start_offset: Option<i64>,
     // `replaced` is logically a vector, but stored as a map for convenient conversion with
     // legacy JSON encoding which uses a map.
@@ -307,10 +310,21 @@ pub struct PartitionManifest {
 
     // >> Since v23.2.x, in manifest format v2
     pub cloud_log_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub archive_start_offset: Option<i64>,
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub archive_start_offset_delta: Option<i64>,
+    #[serde(skip_serializing_if = "offset_has_default_value")]
     pub archive_clean_offset: Option<i64>,
     // << Since v23.2.x
+}
+
+fn offset_has_default_value(offset: &Option<i64>) -> bool {
+    match offset {
+        None => true,
+        Some(o) if *o == i64::MIN => true,
+        _ => false
+    }
 }
 
 fn read_string(mut cursor: &mut dyn std::io::Read) -> Result<String, BucketReaderError> {
@@ -776,7 +790,7 @@ mod tests {
         assert_eq!(manifest.topic, "test-topic");
 
         assert_eq!(manifest.replaced.is_some(), true);
-        let replaced_segs = manifest.replaced.unwrap();
+        let replaced_segs = manifest.replaced.as_ref().unwrap();
         assert_eq!(replaced_segs["6756-1-v1.log"].base_offset, 6756);
         assert_eq!(replaced_segs["6756-1-v1.log"].sname_format, 3);
         assert_eq!(replaced_segs["6889-1-v1.log"].base_offset, 6889);
@@ -786,6 +800,9 @@ mod tests {
         assert_eq!(manifest.start_offset, Some(0));
         assert_eq!(manifest.last_offset, 7017);
         assert_eq!(manifest.last_uploaded_compacted_offset, Some(-9223372036854775808));
+
+        let json_manifest = serde_json::to_string(&manifest).unwrap();
+        assert_eq!(json_manifest.find("last_uploaded_compacted_offset"), None);
 
     }
 }
