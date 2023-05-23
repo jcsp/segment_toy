@@ -316,6 +316,8 @@ pub struct PartitionManifest {
     pub archive_start_offset_delta: Option<i64>,
     #[serde(skip_serializing_if = "offset_has_default_value")]
     pub archive_clean_offset: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archive_size_bytes: Option<u64>
     // << Since v23.2.x
 }
 
@@ -494,6 +496,12 @@ impl PartitionManifest {
         let archive_start_offset_delta = read_i64(&mut reader)?;
         let archive_clean_offset = read_i64(&mut reader)?;
         let _start_kafka_offset = read_i64(&mut reader)?;
+        
+        let archive_size_bytes = if (reader.position() as u32) < envelope.size {
+            Some(read_u64(&mut reader)?)
+        } else {
+            None
+        };
 
         Ok(PartitionManifest {
             version: envelope.version as u32,
@@ -511,6 +519,7 @@ impl PartitionManifest {
             archive_start_offset: Some(archive_start_offset),
             archive_start_offset_delta: Some(archive_start_offset_delta),
             archive_clean_offset: Some(archive_clean_offset),
+            archive_size_bytes: archive_size_bytes
         })
 
         // TODO: respect envelope + skip any unread bytes
