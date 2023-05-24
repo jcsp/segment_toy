@@ -236,7 +236,7 @@ impl BucketReader {
             } else if key.ends_with("/topic_manifest.json") {
                 debug!("Parsing topic manifest key {}", key);
                 self.ingest_topic_manifest(&key).await?;
-            } else if key.contains("manifest.json_") || key.contains("manifest.bin_") {
+            } else if key.contains("manifest.json.") || key.contains("manifest.bin.") {
                 debug!("Parsing partition archive manifest key {}", key);
                 self.ingest_archive_manifest(&key).await?;
             } else if key.ends_with(".index") {
@@ -400,9 +400,9 @@ impl BucketReader {
         key: &str,
         buf: bytes::Bytes,
     ) -> Result<PartitionManifest, BucketReaderError> {
-        if key.ends_with(".json") || key.contains(".json_") {
+        if key.ends_with(".json") || key.contains(".json.") {
             Ok(serde_json::from_slice(&buf)?)
-        } else if key.ends_with(".bin") || key.contains(".bin_") {
+        } else if key.ends_with(".bin") || key.contains(".bin.") {
             Ok(PartitionManifest::from_bytes(buf)?)
         } else {
             Err(BucketReaderError::SyntaxError("Malformed key".to_string()))
@@ -469,7 +469,7 @@ impl BucketReader {
     async fn ingest_archive_manifest(&mut self, key: &str) -> Result<(), BucketReaderError> {
         lazy_static! {
             static ref PARTITION_MANIFEST_KEY: Regex =
-                Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/manifest.(?:json|bin)_(\\d+)_(\\d+)_(\\d+)_(\\d+)_(\\d+)_(\\d+)").unwrap();
+                Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/manifest.(?:json|bin)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)\\.(\\d+)").unwrap();
         }
         if let Some(grps) = PARTITION_MANIFEST_KEY.captures(key) {
             // Group::get calls are safe to unwrap() because regex always has those groups if it matched
@@ -538,7 +538,7 @@ impl BucketReader {
                 }
             }
         } else {
-            warn!("Malformed partition manifest key {}", key);
+            warn!("Malformed partition archive manifest key {}", key);
             self.anomalies.malformed_manifests.push(key.to_string());
         }
         Ok(())
