@@ -2,7 +2,9 @@ use crate::error::BucketReaderError;
 use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTP, NTPR};
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
+use lazy_static::lazy_static;
 use log::warn;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -43,6 +45,19 @@ struct ColumnReader<A: DeltaAlg + 'static> {
 /// to SegmentNameFormat::V1
 fn segment_shortname(base_offset: RawOffset, segment_term: RaftTerm) -> String {
     format!("{}-{}-v1.log", base_offset, segment_term)
+}
+
+pub fn parse_segment_shortname(shortname: &str) -> Option<(RawOffset, RaftTerm)> {
+    lazy_static! {
+        static ref SHORTNAME: Regex = Regex::new("(\\d+)-(\\d+)-v1.log").unwrap();
+    }
+    if let Some(grps) = SHORTNAME.captures(shortname) {
+        let base_offset = grps.get(1).unwrap().as_str().parse::<i64>().unwrap();
+        let segment_term = grps.get(2).unwrap().as_str().parse::<i64>().unwrap();
+        Some((base_offset as RawOffset, segment_term as RaftTerm))
+    } else {
+        None
+    }
 }
 
 impl<A: DeltaAlg> ColumnReader<A> {
@@ -674,9 +689,9 @@ impl PartitionManifest {
         let segment_term = match segment.segment_term {
             Some(t) => t,
             None => {
-                // TODO: if we want to support pre-22.3.x manifests, need to scape segment
-                // term out of the segment's shortname from the manifest, as it isn't in
-                // the segment object
+                // bucket_reader should have cleaned up metadata to substitute segment_term
+                // from the key in the manifest dict via parse_segment_shortname: this should
+                // not happen.
                 warn!("Segment without segment_term set");
                 return None;
             }

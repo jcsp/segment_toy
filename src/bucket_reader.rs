@@ -2,7 +2,8 @@ use crate::error::BucketReaderError;
 use crate::fundamental::{RaftTerm, RawOffset, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
-    ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment, TopicManifest,
+    parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
+    TopicManifest,
 };
 use async_stream::stream;
 use futures::stream::{BoxStream, Stream};
@@ -578,6 +579,22 @@ impl BucketReader {
             self.partition_manifests.len()
         );
         debug!("Loaded {} topic manifests", self.topic_manifests.len());
+
+        // Clean up metadata
+        for (ntpr, partition_metadata) in &mut self.partition_manifests {
+            if let Some(manifest) = &mut partition_metadata.head_manifest {
+                if let Some(segments) = &mut manifest.segments {
+                    for (segment_shortname, segment) in segments {
+                        if segment.segment_term.is_none() {
+                            let parsed = parse_segment_shortname(segment_shortname);
+                            if let Some(parsed) = parsed {
+                                segment.segment_term = Some(parsed.1 as u64);
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // =======
         // Phase 3: Analyze for correctness
