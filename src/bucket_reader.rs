@@ -37,15 +37,13 @@ pub struct PartitionObjects {
 
     // Segments not included in segment_objects because they conflict with another
     // segment, e.g. two uploads with the same base offset but different terms.
-    pub dropped_objects: Vec<String>,
-
     // These dropped objects _might_ be preferable to some objects with the same
     // base_offset that are present in `segment_objects`: when reconstructing metadata,
     // it may be necessary to fully read segments to make a decision about which to
     // use.  If this vector is empty, then `segment_objects` may be treated as a robust
     // source of truth for the list of segments to include in a reconstructed partition
     // manifest.
-    pub dropped_objects_ambiguous: Vec<String>,
+    pub dropped_objects: Vec<SegmentObject>,
 }
 
 impl PartitionObjects {
@@ -53,35 +51,100 @@ impl PartitionObjects {
         Self {
             segment_objects: BTreeMap::new(),
             dropped_objects: Vec::new(),
-            dropped_objects_ambiguous: Vec::new(),
+        }
+    }
+
+    /// Find the SegmentObject at this offset.  If the SegmentObject was in a dropped_* list,
+    /// then swap it into the main list and demote whoever previously held that offset.
+    /// Calling this for all segments in manifests results in a PartitionObjects whose
+    /// segment_objects should be a superset of the segments in the manifest.
+    fn get_and_adjust(
+        &mut self,
+        base_offset: RawOffset,
+        expect_key: &str,
+    ) -> Option<&SegmentObject> {
+        if self.segment_objects.contains_key(&base_offset) {
+            if let Some(found) = self.segment_objects.get_mut(&base_offset) {
+                if found.key != expect_key {
+                    // Go looking for a better match.
+                    for dropped_obj in &mut self.dropped_objects {
+                        if dropped_obj.key == expect_key {
+                            // Something is wrong with our key parsing if this isn't the case
+                            assert_eq!(dropped_obj.base_offset, base_offset);
+                            // Swap the dropped object into segment_objects
+                            std::mem::swap(dropped_obj, found);
+                            return Some(found);
+                        }
+                    }
+
+                    return None;
+                } else {
+                    return Some(found);
+                }
+            } else {
+                unreachable!();
+            }
+        } else {
+            // Maybe we dropped the segment referred to in the manifest?
+            let mut found: Option<usize> = None;
+            for (i, dropped_obj) in self.dropped_objects.iter_mut().enumerate() {
+                if dropped_obj.key == expect_key {
+                    // Something is wrong with our key parsing if this isn't the case
+                    assert_eq!(dropped_obj.base_offset, base_offset);
+
+                    found = Some(i);
+                    break;
+                }
+            }
+
+            if let Some(i) = found {
+                let o = self.dropped_objects.remove(i);
+                let replaced = self.segment_objects.insert(o.base_offset, o);
+
+                // We already checked for the expected offset in the earlier branch
+                assert!(replaced.is_none());
+
+                return Some(self.segment_objects.get(&base_offset).unwrap());
+            } else {
+                return None;
+            }
         }
     }
 
     fn push(&mut self, obj: SegmentObject) {
         let existing = self.segment_objects.get(&obj.base_offset);
-        let mut ambiguous = false;
+        //let mut ambiguous = false;
         if let Some(existing) = existing {
-            if existing.upload_term > obj.upload_term {
-                self.dropped_objects.push(obj.key);
+            // if existing.upload_term > obj.upload_term {
+            //     self.dropped_objects.push(obj.key);
+            //     return;
+            // } else if existing.upload_term == obj.upload_term {
+            //     // Ambiguous case: two objects at same base offset uploaded in the same term can be:
+            //     // - An I/O error, then uploading a larger object later because there's more data
+            //     // - Compaction re-upload, where a smaller object replaces a larger one
+            //     // - Adjacent segment compaction, where a larger object replaces a smaller one.
+            //     //
+            //     // It is safer to prefer larger objects, as this avoids any possibility of
+            //     // data loss if we get it wrong, and a reader can intentionally stop reading
+            //     // when it gets to an offset that should be provided by the following segment.
+            //     //
+            //     // The output from reading a partition based on this class's reconstruction
+            //     // may therefore see duplicate batches, and should account for that.
+            //     if existing.size_bytes > obj.size_bytes {
+            //         self.dropped_objects_ambiguous.push(obj.key);
+            //         return;
+            //     } else {
+            //         ambiguous = true;
+            //     }
+            // }
+
+            // TODO: reinstate distinction between ambiguous and non
+
+            if existing.upload_term > obj.upload_term
+                || (existing.upload_term == obj.upload_term && existing.size_bytes > obj.size_bytes)
+            {
+                self.dropped_objects.push(obj);
                 return;
-            } else if existing.upload_term == obj.upload_term {
-                // Ambiguous case: two objects at same base offset uploaded in the same term can be:
-                // - An I/O error, then uploading a larger object later because there's more data
-                // - Compaction re-upload, where a smaller object replaces a larger one
-                // - Adjacent segment compaction, where a larger object replaces a smaller one.
-                //
-                // It is safer to prefer larger objects, as this avoids any possibility of
-                // data loss if we get it wrong, and a reader can intentionally stop reading
-                // when it gets to an offset that should be provided by the following segment.
-                //
-                // The output from reading a partition based on this class's reconstruction
-                // may therefore see duplicate batches, and should account for that.
-                if existing.size_bytes > obj.size_bytes {
-                    self.dropped_objects_ambiguous.push(obj.key);
-                    return;
-                } else {
-                    ambiguous = true;
-                }
             }
 
             // Fall through and permit the input object to replace the existing
@@ -90,24 +153,21 @@ impl PartitionObjects {
 
         let replaced = self.segment_objects.insert(obj.base_offset, obj);
         if let Some(replaced) = replaced {
-            if ambiguous {
-                self.dropped_objects_ambiguous.push(replaced.key)
-            } else {
-                self.dropped_objects.push(replaced.key)
-            }
+            self.dropped_objects.push(replaced)
         }
     }
 
     /// All the objects we know about, including those that may be redundant/orphan.
     pub fn all_keys(&self) -> impl Iterator<Item = String> + '_ {
-        let i1 = self.dropped_objects.iter().map(|o| o.clone());
+        let i1 = self.dropped_objects.iter().map(|o| o.key.clone());
         let i2 = self
             .segment_objects
             .values()
             .into_iter()
             .map(|o| o.key.clone());
-        let i3 = self.dropped_objects_ambiguous.iter().map(|o| o.clone());
-        i3.chain(i2.chain(i1))
+        // let i3 = self.dropped_objects_ambiguous.iter().map(|o| o.clone());
+        // i3.chain(i2.chain(i1))
+        i2.chain(i1)
     }
 }
 
@@ -589,7 +649,7 @@ impl BucketReader {
                 }
             };
 
-            let raw_objects = self.partitions.get(&ntpr);
+            let mut raw_objects = self.partitions.get_mut(&ntpr);
 
             // For all segments in the manifest, check they were found in the bucket
             debug!(
@@ -617,10 +677,9 @@ impl BucketReader {
                     );
                     if let Some(expect_key) = partition_manifest.segment_key(segment) {
                         debug!("Calculated segment {}", expect_key);
-                        if let Some(raw_objects) = raw_objects {
+                        if let Some(raw_objects) = raw_objects.as_mut() {
                             let found = raw_objects
-                                .segment_objects
-                                .get(&(segment.base_offset as RawOffset));
+                                .get_and_adjust(segment.base_offset as RawOffset, &expect_key);
                             match found {
                                 Some(so) => {
                                     if expect_key != so.key {
@@ -827,7 +886,7 @@ impl BucketReader {
         self.load_manifests(manifest_keys).await?;
 
         // Clean up metadata
-        for (ntpr, partition_metadata) in &mut self.partition_manifests {
+        for (_ntpr, partition_metadata) in &mut self.partition_manifests {
             if let Some(manifest) = &mut partition_metadata.head_manifest {
                 if let Some(segments) = &mut manifest.segments {
                     for (segment_shortname, segment) in segments {
