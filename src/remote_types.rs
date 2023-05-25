@@ -344,27 +344,53 @@ pub struct PartitionManifest {
 }
 
 impl PartitionManifest {
-    pub fn start_offsets(&self) -> (RawOffset, KafkaOffset) {
+    fn get_sorted_segments(&self) -> Vec<&PartitionManifestSegment> {
+        // TODO we should just hold segments in sorted order (currently a hashmap)
         if self.segments.is_none() || self.segments.as_ref().unwrap().is_empty() {
+            vec![]
+        } else {
+            let mut segments: Vec<&PartitionManifestSegment> =
+                self.segments.as_ref().unwrap().values().collect();
+            segments.sort_by_key(|s| s.base_offset);
+            segments
+        }
+    }
+
+    pub fn start_offsets(&self) -> (RawOffset, KafkaOffset) {
+        let segments = self.get_sorted_segments();
+        if segments.is_empty() {
             // We cannot report a Kafka offset because an empty segment
             // set doesn't provide a delta offset.
-            return (
+            (
                 self.start_offset.unwrap_or(0) as RawOffset,
                 0 as KafkaOffset,
-            );
+            )
+        } else {
+            // Guarantee to exist because we checked for empty at start of fn
+            let base_segment = segments.get(0).unwrap();
+
+            (
+                base_segment.base_offset as RawOffset,
+                (base_segment.base_offset - base_segment.delta_offset.unwrap_or(0)) as KafkaOffset,
+            )
         }
+    }
 
-        let mut segments: Vec<&PartitionManifestSegment> =
-            self.segments.as_ref().unwrap().values().collect();
-        segments.sort_by_key(|s| s.base_offset);
-
-        // Guarantee to exist because we checked for empty at start of fn
-        let base_segment = segments.get(0).unwrap();
-
-        (
-            base_segment.base_offset as RawOffset,
-            (base_segment.base_offset - base_segment.delta_offset.unwrap_or(0)) as KafkaOffset,
-        )
+    pub fn kafka_watermarks(&self) -> Option<(KafkaOffset, KafkaOffset)> {
+        let segments = self.get_sorted_segments();
+        if segments.is_empty() {
+            None
+        } else {
+            let first = segments.get(0).unwrap();
+            let last = segments.get(segments.len() - 1).unwrap();
+            if first.delta_offset.is_none() || last.delta_offset_end.is_none() {
+                None
+            } else {
+                let lwm = first.base_offset - first.delta_offset.unwrap();
+                let hwm = last.committed_offset + 1 - last.delta_offset_end.unwrap();
+                Some((lwm as KafkaOffset, hwm as KafkaOffset))
+            }
+        }
     }
 
     pub fn get_segment(

@@ -1,5 +1,5 @@
 use crate::error::BucketReaderError;
-use crate::fundamental::{RaftTerm, RawOffset, NTP, NTPR, NTR};
+use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
     parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
@@ -203,6 +203,25 @@ pub struct Anomalies {
     /// Consistency checks found overlapping segments, which may be readable but
     /// indicate a bug in the code that wrote them.
     pub ntpr_overlap_offsets: HashSet<NTPR>,
+}
+/// A convenience for human beings who would like to know things like the total amount of
+/// data in each partition
+#[derive(Serialize)]
+pub struct PartitionMetadataSummary {
+    pub bytes: u64,
+    pub raw_start_offset: RawOffset,
+    pub raw_last_offset: RawOffset,
+
+    // kafka offsets may only be reported for non-empty manifests
+    pub kafka_lwm: Option<KafkaOffset>,
+    pub kafka_hwm: Option<KafkaOffset>,
+}
+
+/// A convenience for human beings who would like to know things like the total amount of
+/// data in each partition
+#[derive(Serialize)]
+pub struct MetadataSummary {
+    pub partitions: BTreeMap<NTPR, PartitionMetadataSummary>,
 }
 
 impl Anomalies {
@@ -583,6 +602,19 @@ impl BucketReader {
         for (ntpr, partition_objects) in &mut self.partitions {
             if !filter.match_ntpr(ntpr) {
                 continue;
+            }
+
+            for object in partition_objects.segment_objects.values() {
+                info!(
+                    "[{}] Main object: {} {}",
+                    ntpr, object.base_offset, object.key
+                );
+            }
+            for object in &partition_objects.dropped_objects {
+                info!(
+                    "[{}] Dropped object: {} {}",
+                    ntpr, object.base_offset, object.key
+                );
             }
 
             if ntpr.ntp.partition_id == 0 {
