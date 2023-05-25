@@ -348,6 +348,23 @@ impl SegmentStream {
     }
 }
 
+#[derive(Clone)]
+enum FetchKey {
+    PartitionManifest(String),
+    ArchiveManifest(String),
+    TopicManifest(String),
+}
+
+impl FetchKey {
+    fn as_str(&self) -> &str {
+        match self {
+            FetchKey::PartitionManifest(s) => s,
+            FetchKey::TopicManifest(s) => s,
+            FetchKey::ArchiveManifest(s) => s,
+        }
+    }
+}
+
 impl BucketReader {
     pub async fn from_file(
         path: &str,
@@ -391,131 +408,10 @@ impl BucketReader {
         }
     }
 
-    pub async fn scan(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
-        // TODO: for this to work at unlimited scale, we need:
-        //  - load the manifests first, and only bother storing extra vectors
-        //    of segments if those segments aren't in the manifest
-        //  - or use a disk-spilling database for all this state.
-
-        // Must clone because otherwise we hold immutable reference to `self` while
-        // iterating through list results
-        let client = self.client.clone();
-
-        // TODO: we may estimate the total number of objects in the bucket by
-        // doing a listing with delimiter at the base of the bucket.  (1000 / (The highest
-        // hash prefix we see)) * 4E9 -> approximate object count
-
-        // =======
-        // Phase 1: List all objects in the bucket
-        // =======
-
-        let list_stream = list_parallel(client.as_ref(), 16).await?;
-        pin_utils::pin_mut!(list_stream);
-
-        #[derive(Clone)]
-        enum FetchKey {
-            PartitionManifest(String),
-            ArchiveManifest(String),
-            TopicManifest(String),
-        }
-
-        impl FetchKey {
-            fn as_str(&self) -> &str {
-                match self {
-                    FetchKey::PartitionManifest(s) => s,
-                    FetchKey::TopicManifest(s) => s,
-                    FetchKey::ArchiveManifest(s) => s,
-                }
-            }
-        }
-
-        let mut manifest_keys: Vec<FetchKey> = vec![];
-
-        fn maybe_stash_partition_key(keys: &mut Vec<FetchKey>, k: FetchKey, filter: &NTPFilter) {
-            lazy_static! {
-                static ref META_NTP_PREFIX: Regex =
-                    Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/.+").unwrap();
-            }
-            if let Some(grps) = META_NTP_PREFIX.captures(k.as_str()) {
-                let ns = grps.get(1).unwrap().as_str();
-                let topic = grps.get(2).unwrap().as_str();
-                // (TODO: these aren't really-truly safe to unwrap because the string might have had too many digits)
-                let partition_id = grps.get(3).unwrap().as_str().parse::<u32>().unwrap();
-                let partition_revision = grps.get(4).unwrap().as_str().parse::<i64>().unwrap();
-
-                if filter.match_parts(ns, topic, Some(partition_id), Some(partition_revision)) {
-                    debug!("Stashing partition manifest key {}", k.as_str());
-                    keys.push(k);
-                } else {
-                    debug!("Dropping filtered-out manifest key {}", k.as_str());
-                }
-            } else {
-                // Drop it.
-                warn!("Dropping malformed manifest key {}", k.as_str());
-            }
-        }
-
-        fn maybe_stash_topic_key(keys: &mut Vec<FetchKey>, k: FetchKey, filter: &NTPFilter) {
-            lazy_static! {
-                static ref META_NTP_PREFIX: Regex =
-                    Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/.+").unwrap();
-            }
-            if let Some(grps) = META_NTP_PREFIX.captures(k.as_str()) {
-                let ns = grps.get(1).unwrap().as_str();
-                let topic = grps.get(2).unwrap().as_str();
-
-                if filter.match_parts(ns, topic, None, None) {
-                    debug!("Stashing topic manifest key {}", k.as_str());
-                    keys.push(k);
-                } else {
-                    debug!("Dropping filtered-out topic key {}", k.as_str());
-                }
-            } else {
-                // Drop it.
-                warn!("Dropping malformed topic key {}", k.as_str());
-            }
-        }
-
-        let mut object_k = 0;
-        while let Some(o_r) = list_stream.next().await {
-            let o = o_r?;
-
-            let key = o.location.to_string();
-            if key.ends_with("/manifest.json") || key.ends_with("/manifest.bin") {
-                maybe_stash_partition_key(
-                    &mut manifest_keys,
-                    FetchKey::PartitionManifest(key),
-                    filter,
-                );
-            } else if key.ends_with("/topic_manifest.json") {
-                maybe_stash_topic_key(&mut manifest_keys, FetchKey::TopicManifest(key), filter);
-            } else if key.contains("manifest.json.") || key.contains("manifest.bin.") {
-                maybe_stash_partition_key(
-                    &mut manifest_keys,
-                    FetchKey::ArchiveManifest(key),
-                    filter,
-                );
-            } else if key.ends_with(".index") {
-                // TODO: do something with index files: currently ignore them as they are
-                // somewhat disposable.  Should track .tx and .index files within
-                // PartitionObjects: we need .tx files to implement read, and we need
-                // both when doing a dump of an ntp for debug.
-                debug!("Ignoring index key {}", key);
-            } else {
-                debug!("Parsing segment key {}", key);
-                self.ingest_segment(&key, &filter, o.size as u64);
-            }
-
-            object_k += 1;
-            if object_k % 10000 == 0 {
-                info!("Scan progress: {} objects", object_k);
-            }
-        }
-
-        // =======
-        // Phase 2: Fetch all the manifests
-        // =======
-
+    async fn load_manifests(
+        &mut self,
+        manifest_keys: Vec<FetchKey>,
+    ) -> Result<(), BucketReaderError> {
         fn getter_stream(
             client: Arc<dyn ObjectStore>,
             keys: Vec<FetchKey>,
@@ -614,27 +510,15 @@ impl BucketReader {
         );
         debug!("Loaded {} topic manifests", self.topic_manifests.len());
 
-        // Clean up metadata
-        for (ntpr, partition_metadata) in &mut self.partition_manifests {
-            if let Some(manifest) = &mut partition_metadata.head_manifest {
-                if let Some(segments) = &mut manifest.segments {
-                    for (segment_shortname, segment) in segments {
-                        if segment.segment_term.is_none() {
-                            let parsed = parse_segment_shortname(segment_shortname);
-                            if let Some(parsed) = parsed {
-                                segment.segment_term = Some(parsed.1 as u64);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        Ok(())
+    }
 
-        // =======
-        // Phase 3: Analyze for correctness
-        // =======
-
+    pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
         for (ntpr, partition_objects) in &mut self.partitions {
+            if !filter.match_ntpr(ntpr) {
+                continue;
+            }
+
             if ntpr.ntp.partition_id == 0 {
                 let t_manifest_o = self.topic_manifests.get(&ntpr.to_ntr());
                 if let None = t_manifest_o {
@@ -681,6 +565,9 @@ impl BucketReader {
         }
 
         for (ntpr, partition_metadata) in &self.partition_manifests {
+            if !filter.match_ntpr(ntpr) {
+                continue;
+            }
             // We will validate the manifest.  If there is no head manifest, that is an anomaly.
             let partition_manifest = match &partition_metadata.head_manifest {
                 Some(pm) => pm,
@@ -806,11 +693,147 @@ impl BucketReader {
         }
 
         for (ntpr, _) in &mut self.partition_manifests {
+            if !filter.match_ntpr(ntpr) {
+                continue;
+            }
             let t_manifest_o = self.topic_manifests.get(&ntpr.to_ntr());
             if let None = t_manifest_o {
                 self.anomalies.ntr_no_topic_manifest.insert(ntpr.to_ntr());
             }
         }
+
+        Ok(())
+    }
+
+    pub async fn scan(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
+        // TODO: for this to work at unlimited scale, we need:
+        //  - load the manifests first, and only bother storing extra vectors
+        //    of segments if those segments aren't in the manifest
+        //  - or use a disk-spilling database for all this state.
+
+        // Must clone because otherwise we hold immutable reference to `self` while
+        // iterating through list results
+        let client = self.client.clone();
+
+        // TODO: we may estimate the total number of objects in the bucket by
+        // doing a listing with delimiter at the base of the bucket.  (1000 / (The highest
+        // hash prefix we see)) * 4E9 -> approximate object count
+
+        // =======
+        // Phase 1: List all objects in the bucket
+        // =======
+
+        let list_stream = list_parallel(client.as_ref(), 16).await?;
+        pin_utils::pin_mut!(list_stream);
+        let mut manifest_keys: Vec<FetchKey> = vec![];
+
+        fn maybe_stash_partition_key(keys: &mut Vec<FetchKey>, k: FetchKey, filter: &NTPFilter) {
+            lazy_static! {
+                static ref META_NTP_PREFIX: Regex =
+                    Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/(\\d+)_(\\d+)/.+").unwrap();
+            }
+            if let Some(grps) = META_NTP_PREFIX.captures(k.as_str()) {
+                let ns = grps.get(1).unwrap().as_str();
+                let topic = grps.get(2).unwrap().as_str();
+                // (TODO: these aren't really-truly safe to unwrap because the string might have had too many digits)
+                let partition_id = grps.get(3).unwrap().as_str().parse::<u32>().unwrap();
+                let partition_revision = grps.get(4).unwrap().as_str().parse::<i64>().unwrap();
+
+                if filter.match_parts(ns, topic, Some(partition_id), Some(partition_revision)) {
+                    debug!("Stashing partition manifest key {}", k.as_str());
+                    keys.push(k);
+                } else {
+                    debug!("Dropping filtered-out manifest key {}", k.as_str());
+                }
+            } else {
+                // Drop it.
+                warn!("Dropping malformed manifest key {}", k.as_str());
+            }
+        }
+
+        fn maybe_stash_topic_key(keys: &mut Vec<FetchKey>, k: FetchKey, filter: &NTPFilter) {
+            lazy_static! {
+                static ref META_NTP_PREFIX: Regex =
+                    Regex::new("[a-f0-9]+/meta/([^]]+)/([^]]+)/.+").unwrap();
+            }
+            if let Some(grps) = META_NTP_PREFIX.captures(k.as_str()) {
+                let ns = grps.get(1).unwrap().as_str();
+                let topic = grps.get(2).unwrap().as_str();
+
+                if filter.match_parts(ns, topic, None, None) {
+                    debug!("Stashing topic manifest key {}", k.as_str());
+                    keys.push(k);
+                } else {
+                    debug!("Dropping filtered-out topic key {}", k.as_str());
+                }
+            } else {
+                // Drop it.
+                warn!("Dropping malformed topic key {}", k.as_str());
+            }
+        }
+
+        let mut object_k = 0;
+        while let Some(o_r) = list_stream.next().await {
+            let o = o_r?;
+
+            let key = o.location.to_string();
+            if key.ends_with("/manifest.json") || key.ends_with("/manifest.bin") {
+                maybe_stash_partition_key(
+                    &mut manifest_keys,
+                    FetchKey::PartitionManifest(key),
+                    filter,
+                );
+            } else if key.ends_with("/topic_manifest.json") {
+                maybe_stash_topic_key(&mut manifest_keys, FetchKey::TopicManifest(key), filter);
+            } else if key.contains("manifest.json.") || key.contains("manifest.bin.") {
+                maybe_stash_partition_key(
+                    &mut manifest_keys,
+                    FetchKey::ArchiveManifest(key),
+                    filter,
+                );
+            } else if key.ends_with(".index") {
+                // TODO: do something with index files: currently ignore them as they are
+                // somewhat disposable.  Should track .tx and .index files within
+                // PartitionObjects: we need .tx files to implement read, and we need
+                // both when doing a dump of an ntp for debug.
+                debug!("Ignoring index key {}", key);
+            } else {
+                debug!("Parsing segment key {}", key);
+                self.ingest_segment(&key, &filter, o.size as u64);
+            }
+
+            object_k += 1;
+            if object_k % 10000 == 0 {
+                info!("Scan progress: {} objects", object_k);
+            }
+        }
+
+        // =======
+        // Phase 2: Fetch all the manifests
+        // =======
+
+        self.load_manifests(manifest_keys).await?;
+
+        // Clean up metadata
+        for (ntpr, partition_metadata) in &mut self.partition_manifests {
+            if let Some(manifest) = &mut partition_metadata.head_manifest {
+                if let Some(segments) = &mut manifest.segments {
+                    for (segment_shortname, segment) in segments {
+                        if segment.segment_term.is_none() {
+                            let parsed = parse_segment_shortname(segment_shortname);
+                            if let Some(parsed) = parsed {
+                                segment.segment_term = Some(parsed.1 as u64);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // =======
+        // Phase 3: Analyze for correctness
+        // =======
+        self.analyze_metadata(&filter).await?;
 
         Ok(())
     }

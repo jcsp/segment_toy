@@ -75,6 +75,12 @@ enum Commands {
         #[arg(short, long)]
         meta_file: Option<String>,
     },
+    AnalyzeMetadata {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        meta_file: String,
+    },
     ScanData {
         #[arg(short, long)]
         source: String,
@@ -492,22 +498,8 @@ async fn scan_data(
     Ok(())
 }
 
-/**
- * Brute-force listing of bucket, read-only scan of metadata,
- * report anomalies.
- */
-async fn scan_metadata(
-    cli: &Cli,
-    source: &str,
-    meta_file: Option<&str>,
-) -> Result<(), BucketReaderError> {
-    let mut reader = make_bucket_reader(cli, source, None).await?;
-    reader.scan(&cli.filter).await?;
-
-    if let Some(out_file) = meta_file {
-        reader.to_file(out_file).await.unwrap();
-    }
-
+/// Return true if corruption is found
+fn report_anomalies(source: &str, reader: BucketReader) -> bool {
     let mut failed = false;
     match reader.anomalies.status() {
         AnomalyStatus::Clean => {
@@ -530,11 +522,43 @@ async fn scan_metadata(
         serde_json::to_string_pretty(&reader.anomalies).unwrap()
     );
 
+    return failed;
+}
+
+/**
+ * Brute-force listing of bucket, read-only scan of metadata,
+ * report anomalies.
+ */
+async fn scan_metadata(
+    cli: &Cli,
+    source: &str,
+    meta_file: Option<&str>,
+) -> Result<(), BucketReaderError> {
+    let mut reader = make_bucket_reader(cli, source, None).await?;
+    reader.scan(&cli.filter).await?;
+
+    if let Some(out_file) = meta_file {
+        reader.to_file(out_file).await.unwrap();
+    }
+
+    let failed = report_anomalies(source, reader);
+
     if failed {
         error!("Issues detected in bucket");
         std::process::exit(-1);
+    } else {
+        Ok(())
     }
+}
 
+async fn analyze_metadata(
+    cli: &Cli,
+    source: &str,
+    meta_file: &str,
+) -> Result<(), BucketReaderError> {
+    let mut reader = make_bucket_reader(cli, source, Some(meta_file)).await?;
+    reader.analyze_metadata(&cli.filter).await?;
+    report_anomalies(source, reader);
     Ok(())
 }
 
@@ -639,6 +663,13 @@ async fn main() {
         }
         Some(Commands::ScanMetadata { source, meta_file }) => {
             let r = scan_metadata(&cli, source, meta_file.as_ref().map(|s| s.as_str())).await;
+            if let Err(e) = r {
+                error!("Error: {:?}", e);
+                std::process::exit(-1);
+            }
+        }
+        Some(Commands::AnalyzeMetadata { source, meta_file }) => {
+            let r = analyze_metadata(&cli, source, meta_file).await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);
