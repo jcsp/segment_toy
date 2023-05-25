@@ -428,7 +428,7 @@ async fn scan_data(
                 if !is_data {
                     offset_delta += bb.header.record_count as u64;
                 } else {
-                    kafka_offset += 1;
+                    kafka_offset += bb.header.record_count as KafkaOffset;
                 }
                 raw_offset += bb.header.record_count as RawOffset;
                 assert_eq!(kafka_offset, raw_offset - offset_delta as RawOffset);
@@ -443,6 +443,12 @@ async fn scan_data(
                             ntpr, seg_meta_delta_end, offset_delta, segment_obj.key
                         );
                         ntp_report.bad_offsets = true;
+
+                        // We do not trust the manifest, but to avoid emitting the same
+                        // warning for every subsequent segment, adjust our delta to
+                        // match the manifest: we have already recorded that the metadata
+                        // is damaged.
+                        offset_delta = seg_meta_delta_end;
                     }
                 }
 
