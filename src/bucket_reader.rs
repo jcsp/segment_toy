@@ -604,19 +604,6 @@ impl BucketReader {
                 continue;
             }
 
-            for object in partition_objects.segment_objects.values() {
-                info!(
-                    "[{}] Main object: {} {}",
-                    ntpr, object.base_offset, object.key
-                );
-            }
-            for object in &partition_objects.dropped_objects {
-                info!(
-                    "[{}] Dropped object: {} {}",
-                    ntpr, object.base_offset, object.key
-                );
-            }
-
             if ntpr.ntp.partition_id == 0 {
                 let t_manifest_o = self.topic_manifests.get(&ntpr.to_ntr());
                 if let None = t_manifest_o {
