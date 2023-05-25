@@ -562,7 +562,6 @@ async fn scan_metadata(
     meta_file: Option<&str>,
 ) -> Result<(), BucketReaderError> {
     let mut reader = make_bucket_reader(cli, source, None).await?;
-    reader.scan(&cli.filter).await?;
 
     if let Some(out_file) = meta_file {
         reader.to_file(out_file).await.unwrap();
