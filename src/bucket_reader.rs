@@ -599,6 +599,10 @@ impl BucketReader {
     }
 
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
+        // During manifest validation, we may stat() some objects that didn't exist
+        // during the initial bucket scan.  Accumulate them here for ingesting afterwards.
+        let mut discovered_objects: Vec<ObjectMeta> = vec![];
+
         for (ntpr, partition_objects) in &mut self.partitions {
             if !filter.match_ntpr(ntpr) {
                 continue;
@@ -702,7 +706,40 @@ impl BucketReader {
                             match found {
                                 Some(so) => {
                                     if expect_key != so.key {
-                                        self.anomalies.missing_segments.push(expect_key);
+                                        match self
+                                            .client
+                                            .head(&object_store::path::Path::from(
+                                                expect_key.as_str(),
+                                            ))
+                                            .await
+                                        {
+                                            Err(e) => {
+                                                match e {
+                                                    object_store::Error::NotFound {
+                                                        path: _,
+                                                        source: _,
+                                                    } => {
+                                                        // Confirmed, the segment really doesn't exist
+                                                        // TODO: we should re-read manifest in case the segment
+                                                        // was legitimately GC'd while we were scanning
+                                                        self.anomalies
+                                                            .missing_segments
+                                                            .push(expect_key);
+                                                    }
+                                                    _ => return Err(BucketReaderError::from(e)),
+                                                }
+                                            }
+                                            Ok(stat) => {
+                                                // The object isn't really missing, it just wasn't
+                                                // written when we did our full scan of the bucket.
+                                                // Load it into the PartitionObjects.
+                                                discovered_objects.push(stat);
+                                                info!(
+                                                    "[{}] Discovered object after scan: {}",
+                                                    ntpr, expect_key
+                                                );
+                                            }
+                                        }
                                     } else {
                                         // Matched up manifest segment with object in bucket
                                     }
@@ -714,7 +751,6 @@ impl BucketReader {
                         }
                     }
                 }
-
                 // Inspect the manifest's offsets:
                 // - Deltas should be monotonic
                 // - Segment offsets should be continuous
@@ -790,6 +826,14 @@ impl BucketReader {
             if let None = t_manifest_o {
                 self.anomalies.ntr_no_topic_manifest.insert(ntpr.to_ntr());
             }
+        }
+
+        for object_meta in discovered_objects {
+            self.ingest_segment(
+                object_meta.location.as_ref(),
+                filter,
+                object_meta.size as u64,
+            )
         }
 
         Ok(())

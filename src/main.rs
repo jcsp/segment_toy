@@ -470,6 +470,7 @@ async fn scan_data(
                         // match the manifest: we have already recorded that the metadata
                         // is damaged.
                         offset_delta = seg_meta_delta_end;
+                        kafka_offset = raw_offset - offset_delta as RawOffset;
                     }
                 }
 
