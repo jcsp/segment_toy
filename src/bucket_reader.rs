@@ -139,6 +139,10 @@ pub struct Anomalies {
 
     /// NTPR that failed consistency checks on its segments' metadata
     pub ntpr_bad_offsets: HashSet<NTPR>,
+
+    /// Consistency checks found overlapping segments, which may be readable but
+    /// indicate a bug in the code that wrote them.
+    pub ntpr_overlap_offsets: HashSet<NTPR>,
 }
 
 impl Anomalies {
@@ -153,6 +157,7 @@ impl Anomalies {
             || !self.ntpr_no_manifest.is_empty()
             || !self.ntr_no_topic_manifest.is_empty()
             || !self.unknown_keys.is_empty()
+            || !self.ntpr_overlap_offsets.is_empty()
         {
             AnomalyStatus::Dirty
         } else {
@@ -242,6 +247,7 @@ impl Anomalies {
             unknown_keys: vec![],
             missing_segments: vec![],
             ntpr_bad_offsets: HashSet::new(),
+            ntpr_overlap_offsets: HashSet::new(),
         }
     }
 }
@@ -677,12 +683,18 @@ impl BucketReader {
                     }
 
                     if let Some(last_committed_offset) = last_committed_offset {
-                        if segment.base_offset as RawOffset != last_committed_offset + 1 {
+                        if segment.base_offset as RawOffset > last_committed_offset + 1 {
                             warn!(
                                 "[{}] Segment {} has gap between base offset and previous segment's committed offset ({})",
                                 ntpr, segment.base_offset, last_committed_offset
                             );
                             self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                        } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
+                            warn!(
+                                "[{}] Segment {} has overlap between base offset and previous segment's committed offset ({})",
+                                ntpr, segment.base_offset, last_committed_offset
+                            );
+                            self.anomalies.ntpr_overlap_offsets.insert(ntpr.clone());
                         }
                     }
 
