@@ -532,11 +532,26 @@ impl BucketReader {
                         FetchKey::TopicManifest(s) => s.clone(),
                         FetchKey::ArchiveManifest(s) =>s.clone(),
                     };
-                    yield async move {(key.clone(), client_clone
+                    yield async move {
+                        let output_key = key.clone();
+                        let response_result = client_clone
                                     .get(&object_store::path::Path::from(raw_key))
-                                    .await.unwrap() // TODO
-                                    .bytes()
-                                    .await)}
+                                    .await;
+                        match response_result {
+                            Err(e) => (output_key, Err(e)),
+                            Ok(response) => {
+                                let bytes_result = response.bytes().await;
+                                match bytes_result {
+                                    Ok(bytes) => {
+                                        (output_key, Ok(bytes))
+                                    },
+                                    Err(e) => {
+                                        (output_key, Err(e))
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -545,7 +560,26 @@ impl BucketReader {
         pin_mut!(buffered);
         while let Some(result) = buffered.next().await {
             let (key, body_r) = result;
-            let body = body_r?;
+            let body = match body_r {
+                Ok(b) => b,
+                Err(e) => {
+                    if let object_store::Error::NotFound {
+                        path: _path,
+                        source: _source,
+                    } = e
+                    {
+                        // This is legal: users may delete topics, and that may happen between
+                        // our object listing and our manifest fetching
+                        info!(
+                            "Manifest key {} removed between object listing and fetch",
+                            key.as_str()
+                        );
+                        continue;
+                    } else {
+                        return Err(BucketReaderError::from(e));
+                    }
+                }
+            };
             match key {
                 FetchKey::PartitionManifest(key) => {
                     debug!(
