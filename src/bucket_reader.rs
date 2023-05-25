@@ -324,8 +324,21 @@ struct SavedBucketReader {
     pub topic_manifests: HashMap<NTR, TopicManifest>,
 }
 
-type SegmentStream = BoxStream<'static, object_store::Result<bytes::Bytes>>;
-type SegmentStreamResult = Result<SegmentStream, BucketReaderError>;
+pub struct SegmentStream {
+    pub stream: Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, object_store::Error>,
+    pub object: SegmentObject,
+}
+
+impl SegmentStream {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, object_store::Error>,
+        SegmentObject,
+    ) {
+        (self.stream, self.object)
+    }
+}
 
 impl BucketReader {
     pub async fn from_file(
@@ -690,7 +703,7 @@ impl BucketReader {
         &self,
         ntpr: &NTPR,
         //) -> Pin<Box<dyn Stream<Item = Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, BucketReaderError> + '_>>
-    ) -> impl Stream<Item = SegmentStreamResult> + '_ {
+    ) -> impl Stream<Item = SegmentStream> + '_ {
         // TODO error handling for parittion DNE
 
         // TODO go via metadata: if we have no manifest, we should synthesize one and validate
@@ -708,14 +721,22 @@ impl BucketReader {
         // ))
         stream! {
             for so in partition_objects.segment_objects.values() {
-                yield self.stream_one(&so.key).await;
+                yield SegmentStream{
+                    stream: self
+                .stream_one(&so.key).await,
+                // TOOD make object a ref
+                object:so.clone()
+                    };
             }
         }
     }
 
     // TODO: return type should include name of the segment we're streaming, so that
     // caller can include it in logs.
-    pub async fn stream_one(&self, key: &String) -> Result<SegmentStream, BucketReaderError> {
+    pub async fn stream_one(
+        &self,
+        key: &String,
+    ) -> Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, object_store::Error> {
         // TOOD Handle request failure
         debug!("stream_one: {}", key);
         let key: &str = &key;

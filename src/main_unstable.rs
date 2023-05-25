@@ -342,11 +342,11 @@ async fn scrub(cli: &Cli, source: &str) {
 /**
  * Rewrite data like-for-like, re-segmenting as we go.
  */
-async fn rewrite(cli: &Cli, source: &str, force: bool) {
+async fn rewrite(cli: &Cli, source: &str, force: bool) -> Result<(), BucketReaderError> {
     let client = build_client(cli, source);
 
     let mut reader = BucketReader::new(client).await;
-    reader.scan(&cli.filter).await.unwrap();
+    reader.scan(&cli.filter).await?;
 
     match reader.anomalies.status() {
         AnomalyStatus::Clean => {
@@ -368,7 +368,7 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
     if let AnomalyStatus::Corrupt = reader.anomalies.status() {
         if !force {
             warn!("Anomalies detected, not proceeding with operation.");
-            return;
+            return Ok(());
         }
     }
 
@@ -385,8 +385,10 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
         info!("Reading partition {:?}", ntpr);
         let data_stream = reader.stream(ntpr);
         pin_mut!(data_stream);
-        while let Some(segment_stream) = data_stream.next().await {
-            let byte_stream = StreamReader::new(segment_stream.unwrap());
+        while let Some(segment_stream_struct) = data_stream.next().await {
+            let (segment_stream_r, _segment_obj) = segment_stream_struct.into_parts();
+            let segment_stream = segment_stream_r?;
+            let byte_stream = StreamReader::new(segment_stream);
             let mut batch_stream = BatchStream::new(byte_stream);
             while let Ok(bb) = batch_stream.read_batch_buffer().await {
                 info!(
@@ -400,6 +402,8 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) {
 
         writer.flush_close().await.unwrap();
     }
+
+    Ok(())
 }
 
 async fn compact(cli: &Cli, source: &str) {
@@ -427,7 +431,10 @@ async fn compact(cli: &Cli, source: &str) {
         info!("Reading partition {:?}", ntpr);
         let data_stream = reader.stream(ntpr);
         pin_mut!(data_stream);
-        while let Some(segment_stream) = data_stream.next().await {
+        while let Some(segment_stream_struct) = data_stream.next().await {
+            let (segment_stream_r, _segment_obj) = segment_stream_struct.into_parts();
+            let segment_stream = segment_stream_r.unwrap();
+
             info!("Compacting segment...");
             let mut dropped_count: u64 = 0;
             let mut retained_count: u64 = 0;
@@ -436,7 +443,7 @@ async fn compact(cli: &Cli, source: &str) {
             let mut seen_keys: HashMap<Option<Vec<u8>>, u64> = HashMap::new();
             let tmp_file_path = "/tmp/compact.bin";
             let mut tmp_file = File::create(tmp_file_path).await.unwrap();
-            let byte_stream = StreamReader::new(segment_stream.unwrap());
+            let byte_stream = StreamReader::new(segment_stream);
             let mut batch_stream = BatchStream::new(byte_stream);
             while let Ok(bb) = batch_stream.read_batch_buffer().await {
                 for r in bb.iter() {
@@ -516,7 +523,7 @@ async fn main() {
     let cli = Cli::parse();
     match &cli.command {
         Some(Commands::Rewrite { source, force }) => {
-            rewrite(&cli, source, *force).await;
+            rewrite(&cli, source, *force).await.unwrap();
         }
         Some(Commands::Scrub { source }) => {
             scrub(&cli, source).await;

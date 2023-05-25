@@ -6,13 +6,13 @@ use std::fmt;
 // Equivalent to model::offset
 pub type RawOffset = i64;
 // Equivalent to kafka::offset
-//pub type KafkaOffset = i64;
+pub type KafkaOffset = i64;
 // Equivalent to model::term_id
 pub type RaftTerm = i64;
 // Equivalent to model::timestamp
 pub type Timestamp = i64;
 
-#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize, Deserialize)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct NTP {
     pub namespace: String,
     pub topic: String,
@@ -29,7 +29,7 @@ impl fmt::Display for NTP {
 }
 
 /// A Topic, uniquely identified by its revision ID
-#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug, Ord, PartialOrd)]
 pub struct NTR {
     pub namespace: String,
     pub topic: String,
@@ -88,7 +88,7 @@ impl<'de> Deserialize<'de> for NTR {
 }
 
 /// A Partition, uniquely identified by its revision ID
-#[derive(Eq, PartialEq, Hash, Debug, Clone)]
+#[derive(Eq, PartialEq, Hash, Debug, Clone, Ord, PartialOrd)]
 pub struct NTPR {
     pub ntp: NTP,
     pub revision_id: i64,

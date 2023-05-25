@@ -1,5 +1,5 @@
 use crate::error::BucketReaderError;
-use crate::fundamental::{NTP, NTPR};
+use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTP, NTPR};
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
 use log::warn;
@@ -41,7 +41,7 @@ struct ColumnReader<A: DeltaAlg + 'static> {
 /// Legagcy manifest JSON format stores segments in maps where the key
 /// is derived from the segment using this mapping.  This is equivalent
 /// to SegmentNameFormat::V1
-fn segment_shortname(base_offset: i64, segment_term: i64) -> String {
+fn segment_shortname(base_offset: RawOffset, segment_term: RaftTerm) -> String {
     format!("{}-{}-v1.log", base_offset, segment_term)
 }
 
@@ -250,7 +250,8 @@ pub fn decode_colstore(
     for i in 0..is_compacted.values.len() {
         let seg_base_offset = base_offset.get(i);
         let seg_segment_term = segment_term.get(i);
-        let shortname = segment_shortname(seg_base_offset, seg_segment_term);
+        let shortname =
+            segment_shortname(seg_base_offset as RawOffset, seg_segment_term as RaftTerm);
 
         segment_map.insert(
             shortname,
@@ -325,6 +326,44 @@ pub struct PartitionManifest {
     pub archive_clean_offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub archive_size_bytes: Option<u64>, // << Since v23.2.x
+}
+
+impl PartitionManifest {
+    pub fn start_offsets(&self) -> (RawOffset, KafkaOffset) {
+        if self.segments.is_none() || self.segments.as_ref().unwrap().is_empty() {
+            // We cannot report a Kafka offset because an empty segment
+            // set doesn't provide a delta offset.
+            return (
+                self.start_offset.unwrap_or(0) as RawOffset,
+                0 as KafkaOffset,
+            );
+        }
+
+        let mut segments: Vec<&PartitionManifestSegment> =
+            self.segments.as_ref().unwrap().values().collect();
+        segments.sort_by_key(|s| s.base_offset);
+
+        // Guarantee to exist because we checked for empty at start of fn
+        let base_segment = segments.get(0).unwrap();
+
+        (
+            base_segment.base_offset as RawOffset,
+            (base_segment.base_offset - base_segment.delta_offset.unwrap_or(0)) as KafkaOffset,
+        )
+    }
+
+    pub fn get_segment(
+        &self,
+        base_offset: RawOffset,
+        segment_term: RaftTerm,
+    ) -> Option<&PartitionManifestSegment> {
+        let shortname = segment_shortname(base_offset, segment_term);
+        if let Some(segments) = &self.segments {
+            segments.get(shortname.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 fn offset_has_default_value(offset: &Option<i64>) -> bool {
