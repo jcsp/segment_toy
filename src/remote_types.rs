@@ -476,6 +476,7 @@ impl PartitionManifest {
             archive_start_offset: Some(i64::MIN),
             archive_start_offset_delta: Some(i64::MIN),
             archive_clean_offset: Some(i64::MIN),
+            archive_size_bytes: Some(0),
         }
     }
 
