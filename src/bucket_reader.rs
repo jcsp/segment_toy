@@ -917,7 +917,7 @@ impl BucketReader {
 
         self.load_manifests(manifest_keys).await?;
 
-        // Clean up metadata
+        // Clean up segment_term fields on legacy-format segments
         for (_ntpr, partition_metadata) in &mut self.partition_manifests {
             if let Some(manifest) = &mut partition_metadata.head_manifest {
                 if let Some(segments) = &mut manifest.segments {
@@ -935,6 +935,8 @@ impl BucketReader {
 
         // =======
         // Phase 3: Analyze for correctness
+        // Note: this has the side effect of tidying up PartitionObjects instances to prefer
+        //       objects in the manifest, if there are multiple objects at same base offset
         // =======
         self.analyze_metadata(&filter).await?;
 

@@ -415,14 +415,19 @@ async fn scan_data(
                 }
 
                 trace!("[{}] Batch {}", ntpr, bb.header);
-                for record in bb.iter() {
-                    ntp_report.records += 1;
-                    trace!(
-                        "[{}] Record o={} s={}",
-                        ntpr,
-                        bb.header.base_offset + record.offset_delta as u64,
-                        record.len
-                    );
+                if (!bb.header.is_compressed()) {
+                    // TODO: decompression
+                    for record in bb.iter() {
+                        ntp_report.records += 1;
+                        trace!(
+                            "[{}] Record o={} s={}",
+                            ntpr,
+                            bb.header.base_offset + record.offset_delta as u64,
+                            record.len
+                        );
+                    }
+                } else {
+                    ntp_report.records += bb.header.record_count as u64;
                 }
 
                 if !is_data {

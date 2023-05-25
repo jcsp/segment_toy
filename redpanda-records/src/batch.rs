@@ -22,6 +22,12 @@ pub struct RecordBatchHeader {
     pub record_count: i32,
 }
 
+impl RecordBatchHeader {
+    pub fn is_compressed(&self) -> bool {
+        return self.record_batch_attributes & 0x7 != 0x0;
+    }
+}
+
 pub const BATCH_HEADER_BYTES: usize = std::mem::size_of::<RecordBatchHeader>();
 
 #[derive(Serialize, Encode)]
