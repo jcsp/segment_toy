@@ -384,8 +384,11 @@ async fn scan_data(
             while let Ok(bb) = batch_stream.read_batch_buffer().await {
                 if (last_status.elapsed().unwrap()) > status_interval {
                     info!(
-                        "[{}] Scanning... {}/{}",
-                        ntpr, ntp_report.bytes, estimate_ntp_size
+                        "[{}] Scanning... offset {} {}/{}MiB",
+                        ntpr,
+                        raw_offset,
+                        ntp_report.bytes / (1024 * 1024),
+                        estimate_ntp_size / (1024 * 1024)
                     );
                     last_status = std::time::SystemTime::now();
                 }
