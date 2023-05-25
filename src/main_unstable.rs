@@ -16,7 +16,7 @@ mod varint;
 use crate::segment_writer::SegmentWriter;
 use bytes::Bytes;
 use futures::{pin_mut, StreamExt};
-use log::{debug, error, info, warn};
+use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -34,7 +34,6 @@ use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
 use object_store::ObjectStore;
 use redpanda_records::{RecordBatchType, RecordOwned};
-use serde_json::json;
 use tokio_util::io::StreamReader;
 
 /// Parser for use with `clap` argument parsing
@@ -80,14 +79,6 @@ enum Commands {
         #[arg(short, long)]
         force: bool,
     },
-    Scan {
-        #[arg(short, long)]
-        source: String,
-        #[arg(short, long)]
-        detail: bool,
-        #[arg(short, long)]
-        out_file: Option<String>,
-    },
     Scrub {
         #[arg(short, long)]
         source: String,
@@ -97,14 +88,6 @@ enum Commands {
         source: String,
     },
     RebuildManifest {
-        #[arg(short, long)]
-        source: String,
-        #[arg(short, long)]
-        sink: String,
-        #[arg(short, long)]
-        meta_file: Option<String>,
-    },
-    Extract {
         #[arg(short, long)]
         source: String,
         #[arg(short, long)]
@@ -310,107 +293,6 @@ async fn make_bucket_reader(cli: &Cli, source: &str, meta_file: Option<&str>) ->
         let mut reader = BucketReader::new(client).await;
         reader.scan(&cli.filter).await.unwrap();
         reader
-    }
-}
-
-async fn extract(
-    cli: &Cli,
-    source: &str,
-    sink: &str,
-    meta_file: Option<&str>,
-) -> Result<(), BucketReaderError> {
-    // If metadata was loaded from a file, it might not be filtered
-    // in a way that lines up with cli.filter: re-filter so that one
-    // can have a monolithic metadata file but extract individual partitions
-    // on demand
-    let bucket_reader = make_bucket_reader(cli, source, meta_file).await;
-
-    // TODO: generalized URI-ish things so that callers can use object stores as sinks
-    let sink_client = object_store::local::LocalFileSystem::new_with_prefix(sink)?;
-
-    for (ntpr, _objects) in bucket_reader.partitions.iter() {
-        if !cli.filter.match_ntpr(ntpr) {
-            continue;
-        } else {
-            info!("extract match: {}", ntpr);
-        }
-
-        let manifest_paths: Vec<object_store::path::Path> = vec!["bin", "json"]
-            .iter()
-            .map(|e| PartitionManifest::manifest_key(&ntpr, e))
-            .map(|s| object_store::path::Path::from(s))
-            .collect();
-
-        for path in &manifest_paths {
-            debug!("Trying to download manifest {}", path);
-            match bucket_reader.client.get(path).await {
-                Ok(get_result) => {
-                    let bytes = get_result.bytes().await?;
-                    sink_client.put(path, bytes).await?;
-                    info!("Downloaded manifest {}", path);
-                }
-                Err(e) => {
-                    match e {
-                        object_store::Error::NotFound { path: _, source: _ } => {
-                            // Normal that one or other of the manifest paths is missing
-                            debug!("Didn't fetch {}: {}", path, e);
-                        }
-                        _ => {
-                            warn!("Unexpected error fetching {}: {}", path, e);
-                            return Err(e.into());
-                        }
-                    }
-                }
-            };
-        }
-    }
-
-    for (ntpr, objects) in bucket_reader.partitions.iter() {
-        if !cli.filter.match_ntpr(ntpr) {
-            continue;
-        } else {
-            info!("extract match: {}", ntpr);
-        }
-
-        for key in objects.all_keys() {
-            info!("Copying {}", key);
-            // TODO; make bucket reader return an object_store::Error?
-            let mut stream = bucket_reader.stream_one(&key).await.unwrap();
-
-            let (_, mut sink_stream) = sink_client
-                .put_multipart(&object_store::path::Path::from(key.as_str()))
-                .await?;
-
-            while let Some(chunk) = stream.next().await {
-                sink_stream.write(chunk.unwrap().as_ref()).await?;
-            }
-            sink_stream.shutdown().await?;
-        }
-    }
-    Ok(())
-}
-
-async fn scan_detail(bucket_reader: BucketReader) {
-    for (ntpr, _) in &bucket_reader.partitions {
-        let data_stream = bucket_reader.stream(ntpr);
-        pin_mut!(data_stream);
-        while let Some(segment_stream) = data_stream.next().await {
-            let segment_stream_data = segment_stream.unwrap();
-            let byte_stream = StreamReader::new(segment_stream_data);
-
-            let mut batch_stream = BatchStream::new(byte_stream);
-            while let Ok(bb) = batch_stream.read_batch_buffer().await {
-                info!("[{}] Batch {}", ntpr, bb.header);
-                for record in bb.iter() {
-                    info!(
-                        "[{}] Record o={} s={}",
-                        ntpr,
-                        bb.header.base_offset + record.offset_delta as u64,
-                        record.len
-                    );
-                }
-            }
-        }
     }
 }
 
@@ -627,59 +509,6 @@ fn build_client(cli: &Cli, bucket: &str) -> Arc<dyn object_store::ObjectStore> {
     }
 }
 
-/**
- * Read-only scan of data, report anomalies, optionally also decode all record batches.
- */
-async fn scan(cli: &Cli, source: &str, detail: bool, out_file: Option<&str>) {
-    let client = build_client(cli, source);
-
-    let mut reader = BucketReader::new(client).await;
-    match reader.scan(&cli.filter).await {
-        Err(e) => {
-            error!("Error scanning bucket: {:?}", e);
-            return;
-        }
-        Ok(_) => {}
-    }
-
-    if let Some(out_file) = out_file {
-        reader.to_file(out_file).await.unwrap();
-    }
-
-    let mut failed = false;
-    match reader.anomalies.status() {
-        AnomalyStatus::Clean => {
-            info!("Scan of bucket {}:\n{}", source, reader.anomalies.report());
-        }
-        _ => {
-            // Report on any unclean bucket contents.
-            warn!(
-                "Anomalies detected in bucket {}:\n{}",
-                source,
-                reader.anomalies.report()
-            );
-
-            failed = true;
-        }
-    }
-
-    println!("{}", json!(reader.anomalies));
-
-    // Detail mode: exhaustive read of all segment contents, down the the record level.
-    if detail {
-        // TODO: wire up the batch/record read to consider any EOFs etc as errors
-        // when reading from S3, and set failed=true here
-
-        // TODO: reinstate scan_detail based on object_store streams
-        scan_detail(reader).await
-    }
-
-    if failed {
-        error!("Issues detected in bucket");
-        std::process::exit(-1);
-    }
-}
-
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -688,15 +517,6 @@ async fn main() {
     match &cli.command {
         Some(Commands::Rewrite { source, force }) => {
             rewrite(&cli, source, *force).await;
-        }
-        Some(Commands::Scan {
-            source,
-            detail,
-            out_file,
-        }) => {
-            // let out_file_str = out_file.clone();
-            // let out_file = out_file_str.as_ref().map(|s| s.as_str());
-            scan(&cli, source, *detail, out_file.as_ref().map(|s| s.as_str())).await;
         }
         Some(Commands::Scrub { source }) => {
             scrub(&cli, source).await;
@@ -711,14 +531,6 @@ async fn main() {
         }) => rebuild_manifest(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str()))
             .await
             .unwrap(),
-        Some(Commands::Extract {
-            source,
-            sink,
-            meta_file,
-        }) => extract(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str()))
-            .await
-            .unwrap(),
-
         None => {}
     }
 }
