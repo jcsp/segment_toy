@@ -262,7 +262,7 @@ async fn scan_data(
 
     let mut report: BTreeMap<NTPR, NTPDataScanResult> = BTreeMap::new();
 
-    for (ntpr, _) in &bucket_reader.partitions {
+    for (ntpr, objects) in &bucket_reader.partitions {
         if !cli.filter.match_ntpr(ntpr) {
             continue;
         }
@@ -290,6 +290,14 @@ async fn scan_data(
             "[{}] Reconciling data & metadata, starting at LWM raw={} kafka={}",
             ntpr, raw_offset, kafka_offset
         );
+
+        let mut estimate_ntp_size = 0;
+        for o in objects.segment_objects.values() {
+            estimate_ntp_size += o.size_bytes;
+        }
+
+        let status_interval = std::time::Duration::from_secs(10);
+        let mut last_status = std::time::SystemTime::now();
 
         let meta_start_raw_offset = raw_offset;
         let meta_start_kafka_offset = kafka_offset;
@@ -374,6 +382,14 @@ async fn scan_data(
 
             let mut batch_stream = BatchStream::new(byte_stream);
             while let Ok(bb) = batch_stream.read_batch_buffer().await {
+                if (last_status.elapsed().unwrap()) > status_interval {
+                    info!(
+                        "[{}] Scanning... {}/{}",
+                        ntpr, ntp_report.bytes, estimate_ntp_size
+                    );
+                    last_status = std::time::SystemTime::now();
+                }
+
                 ntp_report.batches += 1;
                 ntp_report.bytes += bb.header.size_bytes as u64;
 
