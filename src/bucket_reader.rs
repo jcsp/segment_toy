@@ -1,7 +1,9 @@
 use crate::error::BucketReaderError;
 use crate::fundamental::{RaftTerm, RawOffset, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
-use crate::remote_types::{ArchivePartitionManifest, PartitionManifest, TopicManifest};
+use crate::remote_types::{
+    ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment, TopicManifest,
+};
 use async_stream::stream;
 use futures::stream::{BoxStream, Stream};
 use futures::{pin_mut, StreamExt};
@@ -133,6 +135,9 @@ pub struct Anomalies {
 
     /// Segments referenced by a manifest, which do not exist in the bucket
     pub missing_segments: Vec<String>,
+
+    /// NTPR that failed consistency checks on its segments' metadata
+    pub ntpr_bad_offsets: HashSet<NTPR>,
 }
 
 impl Anomalies {
@@ -140,6 +145,7 @@ impl Anomalies {
         if !self.malformed_manifests.is_empty()
             || !self.malformed_topic_manifests.is_empty()
             || !self.missing_segments.is_empty()
+            || !self.ntpr_bad_offsets.is_empty()
         {
             AnomalyStatus::Corrupt
         } else if !self.segments_outside_manifest.is_empty()
@@ -234,6 +240,7 @@ impl Anomalies {
             ntr_no_topic_manifest: HashSet::new(),
             unknown_keys: vec![],
             missing_segments: vec![],
+            ntpr_bad_offsets: HashSet::new(),
         }
     }
 }
@@ -684,6 +691,65 @@ impl BucketReader {
                             }
                         }
                     }
+                }
+
+                // Inspect the manifest's offsets:
+                // - Deltas should be monotonic
+                // - Segment offsets should be continuous
+                let mut last_committed_offset: Option<RawOffset> = None;
+                let mut last_delta: Option<u64> = None;
+                let mut sorted_segments: Vec<&PartitionManifestSegment> =
+                    manifest_segments.values().collect();
+                sorted_segments.sort_by_key(|s| s.base_offset);
+
+                for segment in sorted_segments {
+                    if let Some(last_delta) = last_delta {
+                        match segment.delta_offset {
+                            None => {
+                                // After some segments have a delta offset, subsequent ones must
+                                // as well.
+                                warn!(
+                                    "[{}] Segment {} has missing delta_offset",
+                                    ntpr, segment.base_offset
+                                );
+                                self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                            }
+                            Some(seg_delta) => {
+                                if seg_delta < last_delta {
+                                    warn!(
+                                        "[{}] Segment {} has delta lower than previous",
+                                        ntpr, segment.base_offset
+                                    );
+                                    self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    if segment.delta_offset.is_some() && segment.delta_offset_end.is_some() {
+                        let d_off = segment.delta_offset.unwrap();
+                        let d_off_end = segment.delta_offset_end.unwrap();
+                        if d_off > d_off_end {
+                            warn!(
+                                "[{}] Segment {} has end delta lower than base delta",
+                                ntpr, segment.base_offset
+                            );
+                            self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                        }
+                    }
+
+                    if let Some(last_committed_offset) = last_committed_offset {
+                        if segment.base_offset as RawOffset != last_committed_offset + 1 {
+                            warn!(
+                                "[{}] Segment {} has gap between base offset and previous segment's committed offset ({})",
+                                ntpr, segment.base_offset, last_committed_offset
+                            );
+                            self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                        }
+                    }
+
+                    last_delta = segment.delta_offset_end;
+                    last_committed_offset = Some(segment.committed_offset as RawOffset);
                 }
             }
         }

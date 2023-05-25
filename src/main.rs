@@ -14,7 +14,6 @@ mod varint;
 use log::{debug, error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::fs::metadata;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
