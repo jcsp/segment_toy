@@ -1,5 +1,5 @@
 use crate::error::BucketReaderError;
-use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTP, NTPR, NTR};
+use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
     parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
@@ -175,6 +175,14 @@ impl PartitionObjects {
 }
 
 #[derive(Serialize, Clone)]
+pub struct MetadataGap {
+    pub prev_seg_base: RawOffset,
+    pub prev_seg_committed: RawOffset,
+    pub next_seg_base: RawOffset,
+    pub next_seg_ts: Timestamp,
+}
+
+#[derive(Serialize, Clone)]
 pub struct Anomalies {
     /// Segment objects not mentioned in their manifest
     pub segments_outside_manifest: Vec<String>,
@@ -201,11 +209,17 @@ pub struct Anomalies {
     pub missing_segments: Vec<String>,
 
     /// NTPR that failed consistency checks on its segments' metadata
-    pub ntpr_bad_offsets: HashSet<NTPR>,
+    pub ntpr_bad_deltas: HashSet<NTPR>,
 
     /// Consistency checks found overlapping segments, which may be readable but
     /// indicate a bug in the code that wrote them.
     pub ntpr_overlap_offsets: HashSet<NTPR>,
+
+    /// Where a partition manifest has two segments whose commited+base offsets
+    /// are discontinuous.  This gap is reported as an anomaly, and may also be
+    /// used to cue subsequent data scans.
+    /// Ref Incident 259
+    pub metadata_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
 }
 /// A convenience for human beings who would like to know things like the total amount of
 /// data in each partition
@@ -233,7 +247,8 @@ impl Anomalies {
         if !self.malformed_manifests.is_empty()
             || !self.malformed_topic_manifests.is_empty()
             || !self.missing_segments.is_empty()
-            || !self.ntpr_bad_offsets.is_empty()
+            || !self.ntpr_bad_deltas.is_empty()
+            || !self.metadata_offset_gaps.is_empty()
         {
             AnomalyStatus::Corrupt
         } else if !self.segments_outside_manifest.is_empty()
@@ -304,12 +319,16 @@ impl Anomalies {
             &self.missing_segments,
         ));
         result.push_str(&Self::report_line(
-            "Gaps in offset range, possible data loss",
-            &self.ntpr_bad_offsets,
+            "NTPs with inconsistent offset deltas, possible bad kafka offsets",
+            &self.ntpr_bad_deltas,
         ));
         result.push_str(&Self::report_line(
             "Overlapping offset ranges, possible upload bug",
             &self.ntpr_overlap_offsets,
+        ));
+        result.push_str(&Self::report_line(
+            "NTPs with offset gaps",
+            self.metadata_offset_gaps.keys(),
         ));
         result.push_str(&Self::report_line("Unexpected keys", &self.unknown_keys));
         result
@@ -337,8 +356,9 @@ impl Anomalies {
             ntr_no_topic_manifest: HashSet::new(),
             unknown_keys: vec![],
             missing_segments: vec![],
-            ntpr_bad_offsets: HashSet::new(),
+            ntpr_bad_deltas: HashSet::new(),
             ntpr_overlap_offsets: HashSet::new(),
+            metadata_offset_gaps: HashMap::new(),
         }
     }
 }
@@ -840,6 +860,7 @@ impl BucketReader {
                 // - Deltas should be monotonic
                 // - Segment offsets should be continuous
                 let mut last_committed_offset: Option<RawOffset> = None;
+                let mut last_base_offset: Option<RawOffset> = None;
                 let mut last_max_timestamp = None;
                 let mut last_delta: Option<u64> = None;
                 let mut sorted_segments: Vec<&PartitionManifestSegment> =
@@ -856,7 +877,7 @@ impl BucketReader {
                                     "[{}] Segment {} has missing delta_offset",
                                     ntpr, segment.base_offset
                                 );
-                                self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                                self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
                             }
                             Some(seg_delta) => {
                                 if seg_delta < last_delta {
@@ -864,7 +885,7 @@ impl BucketReader {
                                         "[{}] Segment {} has delta lower than previous",
                                         ntpr, segment.base_offset
                                     );
-                                    self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                                    self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
                                 }
                             }
                         }
@@ -878,7 +899,7 @@ impl BucketReader {
                                 "[{}] Segment {} has end delta lower than base delta",
                                 ntpr, segment.base_offset
                             );
-                            self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                            self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
                         }
                     }
 
@@ -897,7 +918,17 @@ impl BucketReader {
                                 last_max_timestamp.unwrap_or(0),
                                 segment.base_timestamp.unwrap_or(0),
                                 dt.to_rfc3339());
-                            self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
+                            let gap_list = self
+                                .anomalies
+                                .metadata_offset_gaps
+                                .entry(ntpr.clone())
+                                .or_insert_with(|| Vec::new());
+                            gap_list.push(MetadataGap {
+                                next_seg_base: segment.base_offset as RawOffset,
+                                next_seg_ts: segment.base_timestamp.unwrap_or(0) as Timestamp,
+                                prev_seg_committed: last_committed_offset,
+                                prev_seg_base: last_base_offset.unwrap(),
+                            });
                         } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
                             warn!(
                                 "[{}] Segment {} has overlap between base offset and previous segment's committed offset ({})",
@@ -908,6 +939,7 @@ impl BucketReader {
                     }
 
                     last_delta = segment.delta_offset_end;
+                    last_base_offset = Some(segment.base_offset as RawOffset);
                     last_committed_offset = Some(segment.committed_offset as RawOffset);
                     last_max_timestamp = segment.max_timestamp;
                 }

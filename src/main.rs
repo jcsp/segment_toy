@@ -14,8 +14,6 @@ mod varint;
 use log::{debug, error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
-use std::ops::Bound::Included;
-use std::os::linux::raw::stat;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -25,7 +23,7 @@ use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
-use futures::{StreamExt, TryFutureExt};
+use futures::StreamExt;
 use object_store::ObjectStore;
 // TODO use the one in futures?
 use crate::error::BucketReaderError;
@@ -258,7 +256,6 @@ async fn seek(
     ntpr: &NTPR,
     objects: &PartitionObjects,
     manifest: &PartitionManifest,
-    bucket_reader: &BucketReader,
     bounds: (RawOffset, RawOffset),
 ) -> Option<(RawOffset, KafkaOffset)> {
     let (start_offset, end_offset) = bounds;
