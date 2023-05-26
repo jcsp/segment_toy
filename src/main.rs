@@ -137,7 +137,9 @@ async fn make_bucket_reader(
     let client = build_client(cli, source)?;
     if let Some(path) = meta_file {
         info!("Loading metadata for {} from {}", source, path);
-        Ok(BucketReader::from_file(path, client).await?)
+        let mut reader = BucketReader::from_file(path, client).await?;
+        reader.filter(&cli.filter);
+        Ok(reader)
     } else {
         info!("Scanning bucket {}...", source);
         let mut reader = BucketReader::new(client).await;
@@ -531,8 +533,9 @@ async fn scan_data(
 
 /// Return true if corruption is found
 fn report_anomalies(source: &str, reader: BucketReader) -> bool {
+    let summary = reader.get_summary();
     let mut failed = false;
-    match reader.anomalies.status() {
+    match summary.anomalies.status() {
         AnomalyStatus::Clean => {
             info!("Scan of bucket {}:\n{}", source, reader.anomalies.report());
         }
@@ -548,10 +551,7 @@ fn report_anomalies(source: &str, reader: BucketReader) -> bool {
         }
     }
 
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&reader.anomalies).unwrap()
-    );
+    println!("{}", serde_json::to_string_pretty(&summary).unwrap());
 
     return failed;
 }

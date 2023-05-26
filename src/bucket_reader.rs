@@ -171,7 +171,7 @@ impl PartitionObjects {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct Anomalies {
     /// Segment objects not mentioned in their manifest
     pub segments_outside_manifest: Vec<String>,
@@ -221,6 +221,7 @@ pub struct PartitionMetadataSummary {
 /// data in each partition
 #[derive(Serialize)]
 pub struct MetadataSummary {
+    pub anomalies: Anomalies,
     pub partitions: BTreeMap<NTPR, PartitionMetadataSummary>,
 }
 
@@ -616,6 +617,33 @@ impl BucketReader {
         debug!("Loaded {} topic manifests", self.topic_manifests.len());
 
         Ok(())
+    }
+
+    pub fn get_summary(&self) -> MetadataSummary {
+        let mut partitions = BTreeMap::new();
+        for (ntpr, partition_meta) in &self.partition_manifests {
+            if let Some(manifest) = &partition_meta.head_manifest {
+                let kafka_offsets = manifest.kafka_watermarks();
+                partitions.insert(
+                    ntpr.clone(),
+                    PartitionMetadataSummary {
+                        bytes: manifest.get_size_bytes(),
+                        raw_start_offset: manifest.start_offsets().0,
+                        raw_last_offset: manifest.last_offset,
+                        kafka_lwm: kafka_offsets.map(|x| x.0),
+                        kafka_hwm: kafka_offsets.map(|x| x.1),
+                    },
+                );
+            } else {
+                // No manifest, don't include it in summary.  Its objects will still show up
+                // in the list of anomalies is ntp_no_manifest
+            }
+        }
+
+        MetadataSummary {
+            anomalies: self.anomalies.clone(),
+            partitions: partitions,
+        }
     }
 
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {

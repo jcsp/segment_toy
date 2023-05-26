@@ -393,6 +393,24 @@ impl PartitionManifest {
         }
     }
 
+    pub fn get_size_bytes(&self) -> u64 {
+        if let Some(csb) = self.cloud_log_size_bytes {
+            if let Some(asb) = self.archive_size_bytes {
+                csb + asb
+            } else {
+                csb
+            }
+        } else {
+            let mut n: u64 = 0;
+            if let Some(segments) = &self.segments {
+                for s in segments.values() {
+                    n += s.size_bytes as u64;
+                }
+            }
+            n
+        }
+    }
+
     pub fn get_segment(
         &self,
         base_offset: RawOffset,
