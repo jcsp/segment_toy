@@ -12,13 +12,13 @@ mod remote_types;
 mod varint;
 
 use log::{debug, error, info, trace, warn};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bucket_reader::{AnomalyStatus, BucketReader, PartitionObjects};
-use crate::fundamental::{KafkaOffset, RawOffset, NTP, NTPR, NTR};
+use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionObjects};
+use crate::fundamental::{KafkaOffset, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
 use batch_reader::BatchStream;
@@ -91,6 +91,12 @@ enum Commands {
         #[arg(short, long)]
         max_offset: Option<RawOffset>,
     },
+    ScanGaps {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        meta_file: Option<String>,
+    },
     DecodePartitionManifest {
         #[arg(short, long)]
         path: String,
@@ -133,6 +139,9 @@ fn build_client(
     Ok(c)
 }
 
+/// If a meta_file is provided, the resulting BucketReader will _not_ have its anomalies
+/// populated (you must call analyze_metadata() if you want that).  If a meta_file is not
+/// provided, the BucketReader will scan the bucket and also popualate its anomalies.
 async fn make_bucket_reader(
     cli: &Cli,
     source: &str,
@@ -148,6 +157,12 @@ async fn make_bucket_reader(
         info!("Scanning bucket {}...", source);
         let mut reader = BucketReader::new(client).await;
         reader.scan(&cli.filter).await?;
+
+        // Whether the caller wanted the analysis or not, this has the side effect of tidying
+        // up the list of partition objects to match the manifest if there are multiple
+        // objects per base offset
+        reader.analyze_metadata(&cli.filter).await?;
+
         Ok(reader)
     }
 }
@@ -172,7 +187,20 @@ pub struct NTPDataScanResult {
 
     /// One or more segments has disagreement between data and metadata
     /// for Kafka offsets
-    pub bad_offsets: bool,
+    pub kafka_offset_mismatch: bool,
+
+    /// Apparent data overlap (we saw raw offset jump backwards)
+    pub overlap_offsets: bool,
+
+    /// Apparent data loss (we saw raw offset jump forwards)
+    pub missing_offsets: bool,
+
+    /// Segment contains more records than the manifest claims it should
+    /// (a nice problem to have, compared with it being too small)
+    pub segment_oversized: bool,
+
+    /// Segment contained fewer records than the manifest said it should
+    pub segment_undersized: bool,
 
     /// Segments which are not found in the manifest, but it is tolerable because
     /// they are prior to the start of the manifest (i.e retention has removed them)
@@ -197,6 +225,7 @@ pub struct DataScanTopicSummary {
     pub compaction: bool,
     pub transactions: bool,
     pub damaged: bool,
+    pub data_loss: bool,
 }
 
 impl DataScanTopicSummary {
@@ -208,6 +237,7 @@ impl DataScanTopicSummary {
             compaction: false,
             transactions: false,
             damaged: false,
+            data_loss: false,
         }
     }
 }
@@ -229,7 +259,11 @@ impl NTPDataScanResult {
             segments_without_metadata: vec![],
             segments_before_metadata: vec![],
             segments_after_metadata: vec![],
-            bad_offsets: false,
+            missing_offsets: false,
+            overlap_offsets: false,
+            kafka_offset_mismatch: false,
+            segment_oversized: false,
+            segment_undersized: false,
             compaction: false,
             transactions: false,
         }
@@ -244,7 +278,20 @@ impl NTPDataScanResult {
             return true;
         }
 
-        if self.bad_offsets {
+        if self.overlap_offsets
+            || self.kafka_offset_mismatch
+            || self.missing_offsets
+            || self.segment_oversized
+            || self.segment_undersized
+        {
+            return true;
+        }
+
+        false
+    }
+
+    fn data_loss(&self) -> bool {
+        if self.missing_offsets {
             return true;
         }
 
@@ -301,24 +348,23 @@ async fn scan_data_ntp(
     let mut ntp_report = NTPDataScanResult::new();
 
     let metadata_opt = bucket_reader.partition_manifests.get(ntpr);
-    let (manifest_opt, mut raw_offset, mut kafka_offset) = if let Some(metadata) = metadata_opt {
+    let manifest_opt = if let Some(metadata) = metadata_opt {
         if let Some(manifest) = &metadata.head_manifest {
-            let offsets = manifest.start_offsets();
-            (Some(manifest), offsets.0, offsets.1)
+            Some(manifest)
         } else {
             warn!("No head manifest found for NTP {}", ntpr);
             ntp_report.metadata_missing = true;
-            (None, 0 as RawOffset, 0 as KafkaOffset)
+            None
         }
     } else {
         warn!("No metadata found for NTP {}", ntpr);
         ntp_report.metadata_missing = true;
-        (None, 0 as RawOffset, 0 as KafkaOffset)
+        None
     };
 
     let (mut raw_offset, mut kafka_offset) = if let Some(manifest) = manifest_opt {
         if let Some(bounds) = bounds {
-            seek(ntpr, objects, manifest, bucket_reader, bounds)
+            seek(ntpr, objects, manifest, bounds)
                 .await
                 .unwrap_or_else(|| {
                     warn!("[{}] Failed to seek, starting from beginning", ntpr);
@@ -378,7 +424,7 @@ async fn scan_data_ntp(
                     warn!("[{}] Offset translation issue!  At offset {}, but segment meta says {} (segment {})",
                             ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
                         );
-                    ntp_report.bad_offsets = true;
+                    ntp_report.kafka_offset_mismatch = true;
                 }
             }
 
@@ -455,7 +501,7 @@ async fn scan_data_ntp(
                     "[{}] Offset went backward {} -> {} in {}",
                     ntpr, raw_offset, header_base_offset, segment_obj.key
                 );
-                ntp_report.bad_offsets = true;
+                ntp_report.overlap_offsets = true;
                 raw_offset = bb.header.base_offset as RawOffset;
                 kafka_offset = raw_offset - offset_delta as RawOffset;
             } else {
@@ -472,26 +518,15 @@ async fn scan_data_ntp(
                             ntpr, raw_offset, header_base_offset
                         );
 
-                        ntp_report.bad_offsets = true;
+                        ntp_report.missing_offsets = true;
+                        raw_offset = header_base_offset as RawOffset;
                         kafka_offset = raw_offset - offset_delta as RawOffset;
                     }
                 }
             };
 
-            // Check if batch comitted index is in excess of metadata committed index
-            if let Some(meta_seg) = meta_seg_opt {
-                let batch_committed_offset =
-                    bb.header.base_offset + bb.header.record_count as u64 - 1;
-                if batch_committed_offset > meta_seg.committed_offset {
-                    warn!(
-                        "[{}] Data overruns metadata {} > {} in segment {}",
-                        ntpr, batch_committed_offset, meta_seg.committed_offset, segment_obj.key
-                    );
-                }
-            }
-
             trace!("[{}] Batch {}", ntpr, bb.header);
-            if (!bb.header.is_compressed()) {
+            if !bb.header.is_compressed() {
                 // TODO: decompression
                 for record in bb.iter() {
                     ntp_report.records += 1;
@@ -517,13 +552,33 @@ async fn scan_data_ntp(
 
         // End of segment, compare offset with manifest
         if let Some(meta_seg) = meta_seg_opt {
+            if raw_offset - 1 > meta_seg.committed_offset as RawOffset {
+                warn!(
+                    "[{}] Data overruns metadata {} > {} in segment {}",
+                    ntpr,
+                    raw_offset - 1,
+                    meta_seg.committed_offset,
+                    segment_obj.key
+                );
+                ntp_report.segment_oversized = true;
+            } else if raw_offset - 1 < meta_seg.committed_offset as RawOffset {
+                warn!(
+                    "[{}] Data underruns metadata {} < {} in segment {}",
+                    ntpr,
+                    raw_offset - 1,
+                    meta_seg.committed_offset,
+                    segment_obj.key
+                );
+                ntp_report.segment_undersized = true;
+            }
+
             if let Some(seg_meta_delta_end) = meta_seg.delta_offset_end {
                 if seg_meta_delta_end != offset_delta {
                     warn!(
                         "[{}] Bad delta end {} != {} in {}",
                         ntpr, seg_meta_delta_end, offset_delta, segment_obj.key
                     );
-                    ntp_report.bad_offsets = true;
+                    ntp_report.kafka_offset_mismatch = true;
 
                     // We do not trust the manifest, but to avoid emitting the same
                     // warning for every subsequent segment, adjust our delta to
@@ -532,17 +587,6 @@ async fn scan_data_ntp(
                     offset_delta = seg_meta_delta_end;
                     kafka_offset = raw_offset - offset_delta as RawOffset;
                 }
-            }
-
-            if meta_seg.committed_offset != (raw_offset - 1) as u64 {
-                warn!(
-                    "[{}] Bad committed offset {} != {} in {}",
-                    ntpr,
-                    meta_seg.committed_offset,
-                    raw_offset - 1,
-                    segment_obj.key
-                );
-                ntp_report.bad_offsets = true;
             }
         }
 
@@ -609,6 +653,7 @@ async fn scan_data(
         topic_summary.compaction = topic_summary.compaction || ntp_report.compaction;
         topic_summary.transactions = topic_summary.transactions || ntp_report.transactions;
         topic_summary.damaged = topic_summary.damaged || ntp_report.damaged();
+        topic_summary.data_loss = topic_summary.data_loss || ntp_report.data_loss();
     }
 
     let report = DataScanReport {
@@ -617,6 +662,63 @@ async fn scan_data(
     };
 
     println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+    Ok(())
+}
+
+/// This is a specialized routine for historical bugs that would leave offset gaps
+/// in metadata, which may or may not correspond to actual gaps in the underlying data.
+async fn scan_gaps(
+    cli: &Cli,
+    source: &str,
+    meta_file: Option<&str>,
+) -> Result<(), BucketReaderError> {
+    let mut reader = make_bucket_reader(cli, source, meta_file).await?;
+
+    reader.analyze_metadata(&cli.filter).await?;
+
+    #[derive(Serialize)]
+    struct GapScan {
+        ntpr: NTPR,
+        gap: MetadataGap,
+        scan_result: NTPDataScanResult,
+    }
+
+    let mut results: Vec<GapScan> = Vec::new();
+
+    let mut offset_gaps = HashMap::new();
+    std::mem::swap(&mut offset_gaps, &mut reader.anomalies.metadata_offset_gaps);
+
+    for (ntpr, gaps) in offset_gaps {
+        let objects = if let Some(o) = reader.partitions.get(&ntpr) {
+            o
+        } else {
+            // This shouldn't happen: a partition with no objects would not have found
+            // a gap (although in extremis, if there were no data objects at all in the bucket
+            // but a buggy manifest, this could happen)
+            warn!("[{}] Unexpected: no objects for ntpr reporting gap", ntpr);
+            continue;
+        };
+        for gap in gaps {
+            let bounds = if let Some(next_seg) = objects.segment_objects.get(&gap.next_seg_base) {
+                Some((gap.prev_seg_base, next_seg.base_offset + 1))
+            } else {
+                warn!(
+                    "[{}] Unexpected: next seg after gap {} not found",
+                    ntpr, gap.next_seg_base
+                );
+                continue;
+            };
+            let ntp_scan_result = scan_data_ntp(&ntpr, objects, &reader, bounds).await?;
+            results.push(GapScan {
+                ntpr: ntpr.clone(),
+                gap,
+                scan_result: ntp_scan_result,
+            });
+        }
+    }
+
+    println!("{}", serde_json::to_string_pretty(&results).unwrap());
 
     Ok(())
 }
@@ -655,7 +757,7 @@ async fn scan_metadata(
     source: &str,
     meta_file: Option<&str>,
 ) -> Result<(), BucketReaderError> {
-    let mut reader = make_bucket_reader(cli, source, None).await?;
+    let reader = make_bucket_reader(cli, source, None).await?;
 
     if let Some(out_file) = meta_file {
         reader.to_file(out_file).await.unwrap();
@@ -786,6 +888,13 @@ async fn main() {
                 None
             };
             let r = scan_data(&cli, source, meta_file.as_ref().map(|s| s.as_str()), bounds).await;
+            if let Err(e) = r {
+                error!("Error: {:?}", e);
+                std::process::exit(-1);
+            }
+        }
+        Some(Commands::ScanGaps { source, meta_file }) => {
+            let r = scan_gaps(&cli, source, meta_file.as_ref().map(|s| s.as_str())).await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);

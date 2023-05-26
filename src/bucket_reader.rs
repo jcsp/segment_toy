@@ -738,6 +738,9 @@ impl BucketReader {
     }
 
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
+        // In case caller calls it twice
+        self.anomalies = Anomalies::new();
+
         self.filter_old_revisions();
 
         // During manifest validation, we may stat() some objects that didn't exist
@@ -1133,13 +1136,6 @@ impl BucketReader {
                 }
             }
         }
-
-        // =======
-        // Phase 3: Analyze for correctness
-        // Note: this has the side effect of tidying up PartitionObjects instances to prefer
-        //       objects in the manifest, if there are multiple objects at same base offset
-        // =======
-        self.analyze_metadata(&filter).await?;
 
         Ok(())
     }
