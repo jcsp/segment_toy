@@ -17,7 +17,7 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bucket_reader::{AnomalyStatus, BucketReader};
+use crate::bucket_reader::{AnomalyStatus, BucketReader, PartitionObjects};
 use crate::fundamental::{KafkaOffset, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
@@ -86,6 +86,8 @@ enum Commands {
         source: String,
         #[arg(short, long)]
         meta_file: Option<String>,
+        #[arg(short, long)]
+        start_offset: Option<RawOffset>,
     },
     DecodePartitionManifest {
         #[arg(short, long)]
@@ -248,6 +250,252 @@ impl NTPDataScanResult {
     }
 }
 
+async fn scan_data_ntp(
+    ntpr: &NTPR,
+    objects: &PartitionObjects,
+    bucket_reader: &BucketReader,
+    start_offset: Option<RawOffset>,
+) -> Result<NTPDataScanResult, BucketReaderError> {
+    let mut ntp_report = NTPDataScanResult::new();
+
+    let metadata_opt = bucket_reader.partition_manifests.get(ntpr);
+    let (manifest_opt, mut raw_offset, mut kafka_offset) = if let Some(metadata) = metadata_opt {
+        if let Some(manifest) = &metadata.head_manifest {
+            let offsets = manifest.start_offsets();
+            (Some(manifest), offsets.0, offsets.1)
+        } else {
+            warn!("No head manifest found for NTP {}", ntpr);
+            ntp_report.metadata_missing = true;
+            (None, 0 as RawOffset, 0 as KafkaOffset)
+        }
+    } else {
+        warn!("No metadata found for NTP {}", ntpr);
+        ntp_report.metadata_missing = true;
+        (None, 0 as RawOffset, 0 as KafkaOffset)
+    };
+
+    info!(
+        "[{}] Reconciling data & metadata, starting at LWM raw={} kafka={}",
+        ntpr, raw_offset, kafka_offset
+    );
+
+    let mut estimate_ntp_size = 0;
+    for o in objects.segment_objects.values() {
+        estimate_ntp_size += o.size_bytes;
+    }
+
+    let status_interval = std::time::Duration::from_secs(10);
+    let mut last_status = std::time::SystemTime::now();
+
+    let meta_start_raw_offset = raw_offset;
+    let meta_start_kafka_offset = kafka_offset;
+
+    let mut offset_delta = raw_offset as u64 - kafka_offset as u64;
+
+    let data_stream = bucket_reader.stream(ntpr);
+    pin_mut!(data_stream);
+    while let Some(segment_stream_struct) = data_stream.next().await {
+        let (segment_stream_data_r, segment_obj) = segment_stream_struct.into_parts();
+
+        let segment_stream_data = match segment_stream_data_r {
+            Ok(stream) => stream,
+            Err(e) => {
+                warn!("Cannot read segment {}: {}", segment_obj.key, e);
+                // TODO: gracefully handle 404s by reloading manifest and checking again
+                continue;
+            }
+        };
+
+        let byte_stream = StreamReader::new(segment_stream_data);
+
+        // Start of segment, compare offset with manifest
+        let meta_seg_opt = manifest_opt
+            .map(|m| m.get_segment(segment_obj.base_offset, segment_obj.original_term))
+            .unwrap_or(None);
+        if let Some(meta_seg) = meta_seg_opt {
+            if let Some(seg_meta_delta) = meta_seg.delta_offset {
+                let seg_meta_kafka_base = meta_seg.base_offset - seg_meta_delta;
+                if seg_meta_kafka_base != kafka_offset as u64 {
+                    warn!("[{}] Offset translation issue!  At offset {}, but segment meta says {} (segment {})",
+                            ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
+                        );
+                    ntp_report.bad_offsets = true;
+                }
+            }
+
+            if meta_seg.is_compacted {
+                ntp_report.compaction = true;
+            }
+        } else {
+            if let Some(manifest) = manifest_opt {
+                let mut tolerate = false;
+                if let Some(manifest_start_offset) = manifest.start_offset {
+                    if segment_obj.base_offset < manifest_start_offset {
+                        info!(
+                            "[{}] Segment before metadata start ({} < {}): {}",
+                            ntpr, segment_obj.base_offset, manifest_start_offset, segment_obj.key
+                        );
+                        ntp_report
+                            .segments_before_metadata
+                            .push(segment_obj.key.clone());
+                        tolerate = true;
+                    }
+                }
+
+                if segment_obj.base_offset > manifest.last_offset {
+                    info!(
+                        "[{}] Segment after metadata end ({} > {}): {}",
+                        ntpr, segment_obj.base_offset, manifest.last_offset, segment_obj.key
+                    );
+                    ntp_report
+                        .segments_after_metadata
+                        .push(segment_obj.key.clone());
+                    tolerate = true;
+                }
+
+                if !tolerate {
+                    warn!("[{}] Segment not in manifest: {}", ntpr, segment_obj.key);
+                    ntp_report
+                        .segments_without_metadata
+                        .push(segment_obj.key.clone());
+                } else {
+                    // There is no manifest, we already logged metadata_missing, so no
+                    // need to remind for each segment that we cannot find the metadata
+                }
+            }
+        }
+
+        let mut batch_stream = BatchStream::new(byte_stream);
+        while let Ok(bb) = batch_stream.read_batch_buffer().await {
+            if (last_status.elapsed().unwrap()) > status_interval {
+                info!(
+                    "[{}] Scanning... offset {} {}/{}MiB",
+                    ntpr,
+                    raw_offset,
+                    ntp_report.bytes / (1024 * 1024),
+                    estimate_ntp_size / (1024 * 1024)
+                );
+                last_status = std::time::SystemTime::now();
+            }
+
+            ntp_report.batches += 1;
+            ntp_report.bytes += bb.header.size_bytes as u64;
+
+            // TODO; rules for other data types like Tx batches
+            let is_data = bb.header.record_batch_type == RecordBatchType::RaftData as i8;
+
+            if bb.header.record_batch_type == RecordBatchType::TxPrepare as i8
+                || bb.header.record_batch_type == RecordBatchType::TxFence as i8
+            {
+                ntp_report.transactions = true;
+            }
+
+            if raw_offset > bb.header.base_offset as RawOffset {
+                let header_base_offset = bb.header.base_offset;
+                warn!(
+                    "[{}] Offset went backward {} -> {} in {}",
+                    ntpr, raw_offset, header_base_offset, segment_obj.key
+                );
+                ntp_report.bad_offsets = true;
+                raw_offset = bb.header.base_offset as RawOffset;
+                kafka_offset = raw_offset - offset_delta as RawOffset;
+            } else {
+                if ntp_report.compaction {
+                    // Compaction: tolerate gaps
+                    raw_offset = bb.header.base_offset as RawOffset;
+                    kafka_offset = raw_offset - offset_delta as RawOffset;
+                } else {
+                    // We expect offsets to be contiguous, flag if they are not
+                    if raw_offset != bb.header.base_offset as RawOffset {
+                        let header_base_offset = bb.header.base_offset;
+                        warn!(
+                            "[{}] Skipped offsets ({} -> {})",
+                            ntpr, raw_offset, header_base_offset
+                        );
+
+                        ntp_report.bad_offsets = true;
+                        kafka_offset = raw_offset - offset_delta as RawOffset;
+                    }
+                }
+            };
+
+            // Check if batch comitted index is in excess of metadata committed index
+            if let Some(meta_seg) = meta_seg_opt {
+                let batch_committed_offset =
+                    bb.header.base_offset + bb.header.record_count as u64 - 1;
+                if batch_committed_offset > meta_seg.committed_offset {
+                    warn!(
+                        "[{}] Data overruns metadata {} > {} in segment {}",
+                        ntpr, batch_committed_offset, meta_seg.committed_offset, segment_obj.key
+                    );
+                }
+            }
+
+            trace!("[{}] Batch {}", ntpr, bb.header);
+            if (!bb.header.is_compressed()) {
+                // TODO: decompression
+                for record in bb.iter() {
+                    ntp_report.records += 1;
+                    trace!(
+                        "[{}] Record o={} s={}",
+                        ntpr,
+                        bb.header.base_offset + record.offset_delta as u64,
+                        record.len
+                    );
+                }
+            } else {
+                ntp_report.records += bb.header.record_count as u64;
+            }
+
+            if !is_data {
+                offset_delta += bb.header.record_count as u64;
+            } else {
+                kafka_offset += bb.header.record_count as KafkaOffset;
+            }
+            raw_offset += bb.header.record_count as RawOffset;
+            assert_eq!(kafka_offset, raw_offset - offset_delta as RawOffset);
+        }
+
+        // End of segment, compare offset with manifest
+        if let Some(meta_seg) = meta_seg_opt {
+            if let Some(seg_meta_delta_end) = meta_seg.delta_offset_end {
+                if seg_meta_delta_end != offset_delta {
+                    warn!(
+                        "[{}] Bad delta end {} != {} in {}",
+                        ntpr, seg_meta_delta_end, offset_delta, segment_obj.key
+                    );
+                    ntp_report.bad_offsets = true;
+
+                    // We do not trust the manifest, but to avoid emitting the same
+                    // warning for every subsequent segment, adjust our delta to
+                    // match the manifest: we have already recorded that the metadata
+                    // is damaged.
+                    offset_delta = seg_meta_delta_end;
+                    kafka_offset = raw_offset - offset_delta as RawOffset;
+                }
+            }
+
+            if meta_seg.committed_offset != (raw_offset - 1) as u64 {
+                warn!(
+                    "[{}] Bad committed offset {} != {} in {}",
+                    ntpr,
+                    meta_seg.committed_offset,
+                    raw_offset - 1,
+                    segment_obj.key
+                );
+                ntp_report.bad_offsets = true;
+            }
+        }
+    }
+
+    info!(
+        "[{}] Scanned {} records, HWM raw={} kafka={}",
+        ntpr, ntp_report.records, raw_offset, kafka_offset
+    );
+
+    Ok(ntp_report)
+}
+
 /**
  * Walk the data in NTPs matching filter, compare with metadata
  * report anomalies.
@@ -256,6 +504,7 @@ async fn scan_data(
     cli: &Cli,
     source: &str,
     meta_file: Option<&str>,
+    start_offset: Option<RawOffset>,
 ) -> Result<(), BucketReaderError> {
     let bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
 
@@ -269,249 +518,7 @@ async fn scan_data(
             continue;
         }
 
-        let mut ntp_report = NTPDataScanResult::new();
-
-        let metadata_opt = bucket_reader.partition_manifests.get(ntpr);
-        let (manifest_opt, mut raw_offset, mut kafka_offset) = if let Some(metadata) = metadata_opt
-        {
-            if let Some(manifest) = &metadata.head_manifest {
-                let offsets = manifest.start_offsets();
-                (Some(manifest), offsets.0, offsets.1)
-            } else {
-                warn!("No head manifest found for NTP {}", ntpr);
-                ntp_report.metadata_missing = true;
-                (None, 0 as RawOffset, 0 as KafkaOffset)
-            }
-        } else {
-            warn!("No metadata found for NTP {}", ntpr);
-            ntp_report.metadata_missing = true;
-            (None, 0 as RawOffset, 0 as KafkaOffset)
-        };
-
-        info!(
-            "[{}] Reconciling data & metadata, starting at LWM raw={} kafka={}",
-            ntpr, raw_offset, kafka_offset
-        );
-
-        let mut estimate_ntp_size = 0;
-        for o in objects.segment_objects.values() {
-            estimate_ntp_size += o.size_bytes;
-        }
-
-        let status_interval = std::time::Duration::from_secs(10);
-        let mut last_status = std::time::SystemTime::now();
-
-        let meta_start_raw_offset = raw_offset;
-        let meta_start_kafka_offset = kafka_offset;
-
-        let mut offset_delta = raw_offset as u64 - kafka_offset as u64;
-
-        let data_stream = bucket_reader.stream(ntpr);
-        pin_mut!(data_stream);
-        while let Some(segment_stream_struct) = data_stream.next().await {
-            let (segment_stream_data_r, segment_obj) = segment_stream_struct.into_parts();
-
-            let segment_stream_data = match segment_stream_data_r {
-                Ok(stream) => stream,
-                Err(e) => {
-                    warn!("Cannot read segment {}: {}", segment_obj.key, e);
-                    // TODO: gracefully handle 404s by reloading manifest and checking again
-                    continue;
-                }
-            };
-
-            let byte_stream = StreamReader::new(segment_stream_data);
-
-            // Start of segment, compare offset with manifest
-            let meta_seg_opt = manifest_opt
-                .map(|m| m.get_segment(segment_obj.base_offset, segment_obj.original_term))
-                .unwrap_or(None);
-            if let Some(meta_seg) = meta_seg_opt {
-                if let Some(seg_meta_delta) = meta_seg.delta_offset {
-                    let seg_meta_kafka_base = meta_seg.base_offset - seg_meta_delta;
-                    if seg_meta_kafka_base != kafka_offset as u64 {
-                        warn!("[{}] Offset translation issue!  At offset {}, but segment meta says {} (segment {})",
-                            ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
-                        );
-                        ntp_report.bad_offsets = true;
-                    }
-                }
-
-                if meta_seg.is_compacted {
-                    ntp_report.compaction = true;
-                }
-            } else {
-                if let Some(manifest) = manifest_opt {
-                    let mut tolerate = false;
-                    if let Some(manifest_start_offset) = manifest.start_offset {
-                        if segment_obj.base_offset < manifest_start_offset {
-                            info!(
-                                "[{}] Segment before metadata start ({} < {}): {}",
-                                ntpr,
-                                segment_obj.base_offset,
-                                manifest_start_offset,
-                                segment_obj.key
-                            );
-                            ntp_report
-                                .segments_before_metadata
-                                .push(segment_obj.key.clone());
-                            tolerate = true;
-                        }
-                    }
-
-                    if segment_obj.base_offset > manifest.last_offset {
-                        info!(
-                            "[{}] Segment after metadata end ({} > {}): {}",
-                            ntpr, segment_obj.base_offset, manifest.last_offset, segment_obj.key
-                        );
-                        ntp_report
-                            .segments_after_metadata
-                            .push(segment_obj.key.clone());
-                        tolerate = true;
-                    }
-
-                    if !tolerate {
-                        warn!("[{}] Segment not in manifest: {}", ntpr, segment_obj.key);
-                        ntp_report
-                            .segments_without_metadata
-                            .push(segment_obj.key.clone());
-                    } else {
-                        // There is no manifest, we already logged metadata_missing, so no
-                        // need to remind for each segment that we cannot find the metadata
-                    }
-                }
-            }
-
-            let mut batch_stream = BatchStream::new(byte_stream);
-            while let Ok(bb) = batch_stream.read_batch_buffer().await {
-                if (last_status.elapsed().unwrap()) > status_interval {
-                    info!(
-                        "[{}] Scanning... offset {} {}/{}MiB",
-                        ntpr,
-                        raw_offset,
-                        ntp_report.bytes / (1024 * 1024),
-                        estimate_ntp_size / (1024 * 1024)
-                    );
-                    last_status = std::time::SystemTime::now();
-                }
-
-                ntp_report.batches += 1;
-                ntp_report.bytes += bb.header.size_bytes as u64;
-
-                // TODO; rules for other data types like Tx batches
-                let is_data = bb.header.record_batch_type == RecordBatchType::RaftData as i8;
-
-                if bb.header.record_batch_type == RecordBatchType::TxPrepare as i8
-                    || bb.header.record_batch_type == RecordBatchType::TxFence as i8
-                {
-                    ntp_report.transactions = true;
-                }
-
-                if raw_offset > bb.header.base_offset as RawOffset {
-                    let header_base_offset = bb.header.base_offset;
-                    warn!(
-                        "[{}] Offset went backward {} -> {} in {}",
-                        ntpr, raw_offset, header_base_offset, segment_obj.key
-                    );
-                    ntp_report.bad_offsets = true;
-                    raw_offset = bb.header.base_offset as RawOffset;
-                    kafka_offset = raw_offset - offset_delta as RawOffset;
-                } else {
-                    if ntp_report.compaction {
-                        // Compaction: tolerate gaps
-                        raw_offset = bb.header.base_offset as RawOffset;
-                        kafka_offset = raw_offset - offset_delta as RawOffset;
-                    } else {
-                        // We expect offsets to be contiguous, flag if they are not
-                        if raw_offset != bb.header.base_offset as RawOffset {
-                            let header_base_offset = bb.header.base_offset;
-                            warn!(
-                                "[{}] Skipped offsets ({} -> {})",
-                                ntpr, raw_offset, header_base_offset
-                            );
-
-                            ntp_report.bad_offsets = true;
-                            kafka_offset = raw_offset - offset_delta as RawOffset;
-                        }
-                    }
-                };
-
-                // Check if batch comitted index is in excess of metadata committed index
-                if let Some(meta_seg) = meta_seg_opt {
-                    let batch_committed_offset =
-                        bb.header.base_offset + bb.header.record_count as u64 - 1;
-                    if batch_committed_offset > meta_seg.committed_offset {
-                        warn!(
-                            "[{}] Data overruns metadata {} > {} in segment {}",
-                            ntpr,
-                            batch_committed_offset,
-                            meta_seg.committed_offset,
-                            segment_obj.key
-                        );
-                    }
-                }
-
-                trace!("[{}] Batch {}", ntpr, bb.header);
-                if (!bb.header.is_compressed()) {
-                    // TODO: decompression
-                    for record in bb.iter() {
-                        ntp_report.records += 1;
-                        trace!(
-                            "[{}] Record o={} s={}",
-                            ntpr,
-                            bb.header.base_offset + record.offset_delta as u64,
-                            record.len
-                        );
-                    }
-                } else {
-                    ntp_report.records += bb.header.record_count as u64;
-                }
-
-                if !is_data {
-                    offset_delta += bb.header.record_count as u64;
-                } else {
-                    kafka_offset += bb.header.record_count as KafkaOffset;
-                }
-                raw_offset += bb.header.record_count as RawOffset;
-                assert_eq!(kafka_offset, raw_offset - offset_delta as RawOffset);
-            }
-
-            // End of segment, compare offset with manifest
-            if let Some(meta_seg) = meta_seg_opt {
-                if let Some(seg_meta_delta_end) = meta_seg.delta_offset_end {
-                    if seg_meta_delta_end != offset_delta {
-                        warn!(
-                            "[{}] Bad delta end {} != {} in {}",
-                            ntpr, seg_meta_delta_end, offset_delta, segment_obj.key
-                        );
-                        ntp_report.bad_offsets = true;
-
-                        // We do not trust the manifest, but to avoid emitting the same
-                        // warning for every subsequent segment, adjust our delta to
-                        // match the manifest: we have already recorded that the metadata
-                        // is damaged.
-                        offset_delta = seg_meta_delta_end;
-                        kafka_offset = raw_offset - offset_delta as RawOffset;
-                    }
-                }
-
-                if meta_seg.committed_offset != (raw_offset - 1) as u64 {
-                    warn!(
-                        "[{}] Bad committed offset {} != {} in {}",
-                        ntpr,
-                        meta_seg.committed_offset,
-                        raw_offset - 1,
-                        segment_obj.key
-                    );
-                    ntp_report.bad_offsets = true;
-                }
-            }
-        }
-
-        info!(
-            "[{}] Scanned {} records, HWM raw={} kafka={}",
-            ntpr, ntp_report.records, raw_offset, kafka_offset
-        );
+        let ntp_report = scan_data_ntp(ntpr, objects, &bucket_reader, start_offset).await?;
 
         report.insert(ntpr.clone(), ntp_report);
     }
@@ -700,8 +707,18 @@ async fn main() {
 
     let cli = Cli::parse();
     match &cli.command {
-        Some(Commands::ScanData { source, meta_file }) => {
-            let r = scan_data(&cli, source, meta_file.as_ref().map(|s| s.as_str())).await;
+        Some(Commands::ScanData {
+            source,
+            meta_file,
+            start_offset,
+        }) => {
+            let r = scan_data(
+                &cli,
+                source,
+                meta_file.as_ref().map(|s| s.as_str()),
+                *start_offset,
+            )
+            .await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);
