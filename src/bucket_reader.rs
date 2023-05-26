@@ -6,6 +6,7 @@ use crate::remote_types::{
     TopicManifest,
 };
 use async_stream::stream;
+use chrono::Utc;
 use futures::stream::{BoxStream, Stream};
 use futures::{pin_mut, StreamExt};
 use lazy_static::lazy_static;
@@ -15,7 +16,9 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::Add;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamMap;
 
@@ -299,6 +302,14 @@ impl Anomalies {
         result.push_str(&Self::report_line(
             "Segments referenced in manifest but not found",
             &self.missing_segments,
+        ));
+        result.push_str(&Self::report_line(
+            "Gaps in offset range, possible data loss",
+            &self.ntpr_bad_offsets,
+        ));
+        result.push_str(&Self::report_line(
+            "Overlapping offset ranges, possible upload bug",
+            &self.ntpr_overlap_offsets,
         ));
         result.push_str(&Self::report_line("Unexpected keys", &self.unknown_keys));
         result
@@ -646,7 +657,69 @@ impl BucketReader {
         }
     }
 
+    fn filter_old_revisions(&mut self) {
+        // If we see multiple revisions for the same NTP, then all older revisions correspond
+        // to deleted topics.  To avoid making output hard to read when filtering on NTP (without R),
+        // suppress old revisions.
+        let mut latest_revision: HashMap<(String, String), i64> = HashMap::new();
+        for ntpr in self.partitions.keys() {
+            // FIXME: these clones are gratuitous
+            let nt = (ntpr.ntp.namespace.clone(), ntpr.ntp.topic.clone());
+            if let Some(current_max) = latest_revision.get(&nt) {
+                if current_max >= &ntpr.revision_id {
+                    continue;
+                }
+            }
+
+            latest_revision.insert(nt, ntpr.revision_id);
+        }
+
+        let match_ntpr = |ntpr: &NTPR| {
+            // FIXME: these clones are gratuitous
+            let nt = (ntpr.ntp.namespace.clone(), ntpr.ntp.topic.clone());
+            if let Some(latest) = latest_revision.get(&nt) {
+                ntpr.revision_id == *latest
+            } else {
+                true
+            }
+        };
+
+        let match_ntr = |ntr: &NTR| {
+            // FIXME: these clones are gratuitous
+            let nt = (ntr.namespace.clone(), ntr.topic.clone());
+            if let Some(latest) = latest_revision.get(&nt) {
+                ntr.revision_id == *latest
+            } else {
+                true
+            }
+        };
+
+        self.partitions = self
+            .partitions
+            .drain()
+            .filter(|i| match_ntpr(&i.0))
+            .collect();
+
+        self.partition_manifests = self
+            .partition_manifests
+            .drain()
+            .filter(|i| match_ntpr(&i.0))
+            .collect();
+
+        self.topic_manifests = self
+            .topic_manifests
+            .drain()
+            .filter(|i| match_ntr(&i.0))
+            .collect();
+
+        // TODO: re-expose the things we've dropped as candidates for cleanup, and/or add a flag
+        // to optionally disable this culling if user is interested in inspecting data for
+        // partitions they know where deleted+replaced
+    }
+
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
+        self.filter_old_revisions();
+
         // During manifest validation, we may stat() some objects that didn't exist
         // during the initial bucket scan.  Accumulate them here for ingesting afterwards.
         let mut discovered_objects: Vec<ObjectMeta> = vec![];
@@ -767,6 +840,7 @@ impl BucketReader {
                 // - Deltas should be monotonic
                 // - Segment offsets should be continuous
                 let mut last_committed_offset: Option<RawOffset> = None;
+                let mut last_max_timestamp = None;
                 let mut last_delta: Option<u64> = None;
                 let mut sorted_segments: Vec<&PartitionManifestSegment> =
                     manifest_segments.values().collect();
@@ -810,10 +884,19 @@ impl BucketReader {
 
                     if let Some(last_committed_offset) = last_committed_offset {
                         if segment.base_offset as RawOffset > last_committed_offset + 1 {
+                            let ts = SystemTime::UNIX_EPOCH
+                                .add(Duration::from_millis(segment.base_timestamp.unwrap_or(0)));
+                            let dt: chrono::DateTime<Utc> = ts.into();
+
                             warn!(
-                                "[{}] Segment {} has gap between base offset and previous segment's committed offset ({})",
-                                ntpr, segment.base_offset, last_committed_offset
-                            );
+                                "[{}] Segment {} has gap between base offset and previous segment's committed offset ({}).  Missing {} records, from ts {} to ts {} ({})",
+                                ntpr,
+                                segment.base_offset,
+                                last_committed_offset,
+                                segment.base_offset as RawOffset - (last_committed_offset + 1),
+                                last_max_timestamp.unwrap_or(0),
+                                segment.base_timestamp.unwrap_or(0),
+                                dt.to_rfc3339());
                             self.anomalies.ntpr_bad_offsets.insert(ntpr.clone());
                         } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
                             warn!(
@@ -826,6 +909,7 @@ impl BucketReader {
 
                     last_delta = segment.delta_offset_end;
                     last_committed_offset = Some(segment.committed_offset as RawOffset);
+                    last_max_timestamp = segment.max_timestamp;
                 }
             }
         }

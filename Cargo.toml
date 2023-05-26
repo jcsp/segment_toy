@@ -27,6 +27,7 @@ bytes = "1.4.0"
 tokio-stream = "0.1.14"
 async-stream = "0.3.5"
 pin-utils = "0.1.0"
+chrono = "0.4.24"
 
 [[bin]]
 name = "rp-storage-tool"

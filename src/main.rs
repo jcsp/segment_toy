@@ -413,11 +413,27 @@ async fn scan_data(
                         "[{}] Offset went backward {} -> {} in {}",
                         ntpr, raw_offset, header_base_offset, segment_obj.key
                     );
+                    ntp_report.bad_offsets = true;
                     raw_offset = bb.header.base_offset as RawOffset;
+                    kafka_offset = raw_offset - offset_delta as RawOffset;
                 } else {
-                    // Compaction: skip gap
-                    // TODO: complain if this happens in a segment whose meta doesn't say compacted=true
-                    raw_offset = bb.header.base_offset as RawOffset;
+                    if ntp_report.compaction {
+                        // Compaction: tolerate gaps
+                        raw_offset = bb.header.base_offset as RawOffset;
+                        kafka_offset = raw_offset - offset_delta as RawOffset;
+                    } else {
+                        // We expect offsets to be contiguous, flag if they are not
+                        if raw_offset != bb.header.base_offset as RawOffset {
+                            let header_base_offset = bb.header.base_offset;
+                            warn!(
+                                "[{}] Skipped offsets ({} -> {})",
+                                ntpr, raw_offset, header_base_offset
+                            );
+
+                            ntp_report.bad_offsets = true;
+                            kafka_offset = raw_offset - offset_delta as RawOffset;
+                        }
+                    }
                 };
 
                 // Check if batch comitted index is in excess of metadata committed index
