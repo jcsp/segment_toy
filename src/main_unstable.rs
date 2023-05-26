@@ -95,6 +95,28 @@ enum Commands {
         #[arg(short, long)]
         meta_file: Option<String>,
     },
+    FilterMetadata {
+        #[arg(short, long)]
+        source: String,
+        #[arg(short, long)]
+        meta_in: String,
+        #[arg(short, long)]
+        meta_out: String,
+    },
+}
+
+async fn filter_metadata(
+    cli: &Cli,
+    source: &str,
+    meta_in: &str,
+    meta_out: &str,
+) -> Result<(), BucketReaderError> {
+    info!("Loading metadata from {}...", meta_in);
+
+    let mut bucket_reader = make_bucket_reader(cli, source, Some(meta_in)).await;
+    bucket_reader.filter(&cli.filter);
+    bucket_reader.to_file(meta_out).await?;
+    Ok(())
 }
 
 async fn rebuild_manifest(
@@ -103,7 +125,7 @@ async fn rebuild_manifest(
     sink: &str,
     meta_file: Option<&str>,
 ) -> Result<(), BucketReaderError> {
-    info!("Loading metadata from {}...", sink);
+    info!("Loading metadata from {}...", source);
 
     let bucket_reader = make_bucket_reader(cli, source, meta_file).await;
 
@@ -538,6 +560,15 @@ async fn main() {
         }) => rebuild_manifest(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str()))
             .await
             .unwrap(),
+        Some(Commands::FilterMetadata {
+            source,
+            meta_in,
+            meta_out,
+        }) => {
+            filter_metadata(&cli, source, meta_in, meta_out)
+                .await
+                .unwrap();
+        }
         None => {}
     }
 }

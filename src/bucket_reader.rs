@@ -468,6 +468,26 @@ impl BucketReader {
         })
     }
 
+    pub fn filter(&mut self, filter: &NTPFilter) {
+        self.partitions = self
+            .partitions
+            .drain()
+            .filter(|i| filter.match_ntpr(&i.0))
+            .collect();
+
+        self.partition_manifests = self
+            .partition_manifests
+            .drain()
+            .filter(|i| filter.match_ntpr(&i.0))
+            .collect();
+
+        self.topic_manifests = self
+            .topic_manifests
+            .drain()
+            .filter(|i| filter.match_ntr(&i.0))
+            .collect();
+    }
+
     pub async fn to_file(&self, path: &str) -> Result<(), tokio::io::Error> {
         let saved_state = SavedBucketReader {
             partitions: self.partitions.clone(),
@@ -700,54 +720,18 @@ impl BucketReader {
                     );
                     if let Some(expect_key) = partition_manifest.segment_key(segment) {
                         debug!("Calculated segment {}", expect_key);
-                        if let Some(raw_objects) = raw_objects.as_mut() {
-                            let found = raw_objects
-                                .get_and_adjust(segment.base_offset as RawOffset, &expect_key);
-                            match found {
-                                Some(so) => {
-                                    if expect_key != so.key {
-                                        match self
-                                            .client
-                                            .head(&object_store::path::Path::from(
-                                                expect_key.as_str(),
-                                            ))
-                                            .await
-                                        {
-                                            Err(e) => {
-                                                match e {
-                                                    object_store::Error::NotFound {
-                                                        path: _,
-                                                        source: _,
-                                                    } => {
-                                                        // Confirmed, the segment really doesn't exist
-                                                        // TODO: we should re-read manifest in case the segment
-                                                        // was legitimately GC'd while we were scanning
-                                                        self.anomalies
-                                                            .missing_segments
-                                                            .push(expect_key);
-                                                    }
-                                                    _ => return Err(BucketReaderError::from(e)),
-                                                }
-                                            }
-                                            Ok(stat) => {
-                                                // The object isn't really missing, it just wasn't
-                                                // written when we did our full scan of the bucket.
-                                                // Load it into the PartitionObjects.
-                                                discovered_objects.push(stat);
-                                                info!(
-                                                    "[{}] Discovered object after scan: {}",
-                                                    ntpr, expect_key
-                                                );
-                                            }
-                                        }
-                                    } else {
-                                        // Matched up manifest segment with object in bucket
-                                    }
-                                }
-                                None => {
-                                    self.anomalies.missing_segments.push(expect_key);
-                                }
-                            }
+                        if !Self::check_existence(
+                            self.client.clone(),
+                            &mut raw_objects,
+                            segment.base_offset as RawOffset,
+                            &expect_key,
+                            &mut discovered_objects,
+                        )
+                        .await?
+                        {
+                            self.anomalies.missing_segments.push(expect_key);
+                            // TODO: we should re-read manifest in case the segment
+                            // was legitimately GC'd while we were scanning
                         }
                     }
                 }
@@ -835,8 +819,50 @@ impl BucketReader {
                 object_meta.size as u64,
             )
         }
-
         Ok(())
+    }
+
+    async fn check_existence(
+        client: Arc<dyn object_store::ObjectStore>,
+        raw_objects: &mut Option<&mut PartitionObjects>,
+        check_offset: RawOffset,
+        expect_key: &str,
+        discovered: &mut Vec<ObjectMeta>,
+    ) -> Result<bool, object_store::Error> {
+        let found_obj = if let Some(raw_objects) = raw_objects {
+            raw_objects.get_and_adjust(check_offset, &expect_key)
+        } else {
+            None
+        };
+
+        if found_obj.is_some() {
+            return Ok(true);
+        }
+
+        // Object not found in PartitionObjects from scan: do a HEAD to see if it's really
+        // missing
+        match client
+            .head(&object_store::path::Path::from(expect_key))
+            .await
+        {
+            Err(e) => {
+                match e {
+                    object_store::Error::NotFound { path: _, source: _ } => {
+                        info!("Confirmed missing segment with HEAD: {}", expect_key);
+                        // Confirmed, the segment really doesn't exist
+                        Ok(false)
+                    }
+                    _ => Err(e),
+                }
+            }
+            Ok(stat) => {
+                // The object isn't really missing, it just wasn't
+                // written when we did our full scan of the bucket.
+                // Load it into the PartitionObjects.
+                discovered.push(stat);
+                Ok(true)
+            }
+        }
     }
 
     pub async fn scan(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
