@@ -1116,7 +1116,7 @@ impl BucketReader {
     pub fn stream(
         &self,
         ntpr: &NTPR,
-        //) -> Pin<Box<dyn Stream<Item = Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, BucketReaderError> + '_>>
+        seek: Option<RawOffset>, //) -> Pin<Box<dyn Stream<Item = Result<BoxStream<'static, object_store::Result<bytes::Bytes>>, BucketReaderError> + '_>>
     ) -> impl Stream<Item = SegmentStream> + '_ {
         // TODO error handling for parittion DNE
 
@@ -1135,6 +1135,11 @@ impl BucketReader {
         // ))
         stream! {
             for so in partition_objects.segment_objects.values() {
+                if let Some(seek) = seek {
+                    if so.base_offset < seek {
+                        continue;
+                    }
+                }
                 yield SegmentStream{
                     stream: self
                 .stream_one(&so.key).await,

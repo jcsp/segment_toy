@@ -14,16 +14,18 @@ mod varint;
 use log::{debug, error, info, trace, warn};
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
+use std::ops::Bound::Included;
+use std::os::linux::raw::stat;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bucket_reader::{AnomalyStatus, BucketReader, PartitionObjects};
-use crate::fundamental::{KafkaOffset, RawOffset, NTPR, NTR};
+use crate::fundamental::{KafkaOffset, RawOffset, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::PartitionManifest;
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
-use futures::StreamExt;
+use futures::{StreamExt, TryFutureExt};
 use object_store::ObjectStore;
 // TODO use the one in futures?
 use crate::error::BucketReaderError;
@@ -88,6 +90,8 @@ enum Commands {
         meta_file: Option<String>,
         #[arg(short, long)]
         start_offset: Option<RawOffset>,
+        #[arg(short, long)]
+        max_offset: Option<RawOffset>,
     },
     DecodePartitionManifest {
         #[arg(short, long)]
@@ -250,11 +254,52 @@ impl NTPDataScanResult {
     }
 }
 
+async fn seek(
+    ntpr: &NTPR,
+    objects: &PartitionObjects,
+    manifest: &PartitionManifest,
+    bucket_reader: &BucketReader,
+    bounds: (RawOffset, RawOffset),
+) -> Option<(RawOffset, KafkaOffset)> {
+    let (start_offset, end_offset) = bounds;
+    // Look up first segment before start offset
+    let mut range = objects.segment_objects.range(start_offset..=end_offset);
+    if let Some((seg_base_offset, seg)) = range.next() {
+        // This segment will be where we start streaming data from
+        if let Some(manifest_seg) = manifest.get_segment(*seg_base_offset, seg.original_term) {
+            if let Some(manifest_seg_delta) = manifest_seg.delta_offset {
+                let raw_offset = *seg_base_offset as RawOffset;
+                let kafka_offset =
+                    (seg_base_offset - manifest_seg_delta as RawOffset) as KafkaOffset;
+                Some((raw_offset, kafka_offset))
+            } else {
+                warn!(
+                    "[{}] Cannot seek, legacy manifest with no delta offset at {}",
+                    ntpr, seg_base_offset
+                );
+                None
+            }
+        } else {
+            warn!(
+                "[{}] Cannot seek, no segment at {} in manifest",
+                ntpr, seg_base_offset
+            );
+            None
+        }
+    } else {
+        warn!(
+            "[{}] Cannot seek, no segment found ahead of {}",
+            ntpr, start_offset
+        );
+        None
+    }
+}
+
 async fn scan_data_ntp(
     ntpr: &NTPR,
     objects: &PartitionObjects,
     bucket_reader: &BucketReader,
-    start_offset: Option<RawOffset>,
+    bounds: Option<(RawOffset, RawOffset)>,
 ) -> Result<NTPDataScanResult, BucketReaderError> {
     let mut ntp_report = NTPDataScanResult::new();
 
@@ -274,8 +319,27 @@ async fn scan_data_ntp(
         (None, 0 as RawOffset, 0 as KafkaOffset)
     };
 
+    let (mut raw_offset, mut kafka_offset) = if let Some(manifest) = manifest_opt {
+        if let Some(bounds) = bounds {
+            seek(ntpr, objects, manifest, bucket_reader, bounds)
+                .await
+                .unwrap_or_else(|| {
+                    warn!("[{}] Failed to seek, starting from beginning", ntpr);
+                    manifest.start_offsets()
+                })
+        } else {
+            manifest.start_offsets()
+        }
+    } else {
+        warn!("[{}] No manifest, cannot seek", ntpr);
+        (0 as RawOffset, 0 as KafkaOffset)
+    };
+
+    let max_offset = bounds.map(|b| b.1).unwrap_or(RawOffset::MAX);
+
+    let mut offset_delta = raw_offset as u64 - kafka_offset as u64;
     info!(
-        "[{}] Reconciling data & metadata, starting at LWM raw={} kafka={}",
+        "[{}] Reconciling data & metadata, starting at raw={} kafka={}",
         ntpr, raw_offset, kafka_offset
     );
 
@@ -290,9 +354,7 @@ async fn scan_data_ntp(
     let meta_start_raw_offset = raw_offset;
     let meta_start_kafka_offset = kafka_offset;
 
-    let mut offset_delta = raw_offset as u64 - kafka_offset as u64;
-
-    let data_stream = bucket_reader.stream(ntpr);
+    let data_stream = bucket_reader.stream(ntpr, Some(raw_offset));
     pin_mut!(data_stream);
     while let Some(segment_stream_struct) = data_stream.next().await {
         let (segment_stream_data_r, segment_obj) = segment_stream_struct.into_parts();
@@ -486,6 +548,14 @@ async fn scan_data_ntp(
                 ntp_report.bad_offsets = true;
             }
         }
+
+        if raw_offset >= max_offset {
+            info!(
+                "[{}] Reached max offset {} >= {}, stopping scan",
+                ntpr, raw_offset, max_offset
+            );
+            break;
+        }
     }
 
     info!(
@@ -504,7 +574,7 @@ async fn scan_data(
     cli: &Cli,
     source: &str,
     meta_file: Option<&str>,
-    start_offset: Option<RawOffset>,
+    bounds: Option<(RawOffset, RawOffset)>,
 ) -> Result<(), BucketReaderError> {
     let bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
 
@@ -518,7 +588,7 @@ async fn scan_data(
             continue;
         }
 
-        let ntp_report = scan_data_ntp(ntpr, objects, &bucket_reader, start_offset).await?;
+        let ntp_report = scan_data_ntp(ntpr, objects, &bucket_reader, bounds).await?;
 
         report.insert(ntpr.clone(), ntp_report);
     }
@@ -711,14 +781,14 @@ async fn main() {
             source,
             meta_file,
             start_offset,
+            max_offset,
         }) => {
-            let r = scan_data(
-                &cli,
-                source,
-                meta_file.as_ref().map(|s| s.as_str()),
-                *start_offset,
-            )
-            .await;
+            let bounds = if let Some(start) = *start_offset {
+                Some((start, (*max_offset).unwrap_or(RawOffset::MAX)))
+            } else {
+                None
+            };
+            let r = scan_data(&cli, source, meta_file.as_ref().map(|s| s.as_str()), bounds).await;
             if let Err(e) = r {
                 error!("Error: {:?}", e);
                 std::process::exit(-1);

@@ -405,7 +405,7 @@ async fn rewrite(cli: &Cli, source: &str, force: bool) -> Result<(), BucketReade
         let mut writer = SegmentWriter::new(1024 * 1024, dir);
 
         info!("Reading partition {:?}", ntpr);
-        let data_stream = reader.stream(ntpr);
+        let data_stream = reader.stream(ntpr, None);
         pin_mut!(data_stream);
         while let Some(segment_stream_struct) = data_stream.next().await {
             let (segment_stream_r, _segment_obj) = segment_stream_struct.into_parts();
@@ -451,7 +451,7 @@ async fn compact(cli: &Cli, source: &str) {
         let mut writer = SegmentWriter::new(1024 * 1024, dir);
 
         info!("Reading partition {:?}", ntpr);
-        let data_stream = reader.stream(ntpr);
+        let data_stream = reader.stream(ntpr, None);
         pin_mut!(data_stream);
         while let Some(segment_stream_struct) = data_stream.next().await {
             let (segment_stream_r, _segment_obj) = segment_stream_struct.into_parts();
