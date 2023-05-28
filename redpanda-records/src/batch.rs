@@ -26,6 +26,12 @@ impl RecordBatchHeader {
     pub fn is_compressed(&self) -> bool {
         return self.record_batch_attributes & 0x7 != 0x0;
     }
+
+    /// 'data' means counted as data for Kafka offset translation purposes.
+    pub fn is_kafka_data(&self) -> bool {
+        // TODO include other batch types
+        self.record_batch_type == RecordBatchType::RaftData as i8
+    }
 }
 
 pub const BATCH_HEADER_BYTES: usize = std::mem::size_of::<RecordBatchHeader>();

@@ -10,6 +10,7 @@ mod error;
 mod fundamental;
 mod ntp_mask;
 mod remote_types;
+mod repair;
 mod segment_writer;
 mod varint;
 

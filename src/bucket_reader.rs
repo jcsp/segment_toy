@@ -1,3 +1,4 @@
+use crate::batch_reader::BatchStream;
 use crate::error::BucketReaderError;
 use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
@@ -5,6 +6,7 @@ use crate::remote_types::{
     parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
     TopicManifest,
 };
+use crate::repair::{maybe_adjust_manifest, project_repairs, RepairEdit};
 use async_stream::stream;
 use chrono::Utc;
 use futures::stream::{BoxStream, Stream};
@@ -21,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamMap;
+use tokio_util::io::StreamReader;
 
 /// A segment object
 #[derive(Clone, Serialize, Deserialize)]
@@ -30,6 +33,15 @@ pub struct SegmentObject {
     pub upload_term: RaftTerm,
     pub original_term: RaftTerm,
     pub size_bytes: u64,
+}
+
+/// Ground truth about a segment object obtained by fully reading it.  This
+/// may be different from what the manifest metadata claims about the object
+pub struct SegmentDataSummary {
+    pub size_bytes: u64,
+    pub base_offset: RawOffset,
+    pub committed_offset: RawOffset,
+    pub delta_end: u64,
 }
 
 /// The raw objects for a NTP, discovered by scanning the bucket: this is distinct
@@ -57,6 +69,16 @@ impl PartitionObjects {
         }
     }
 
+    pub fn find_dropped(&self, base_offset: RawOffset) -> Vec<&SegmentObject> {
+        let mut result = Vec::new();
+        for o in &self.dropped_objects {
+            if o.base_offset == base_offset {
+                result.push(o);
+            }
+        }
+        result
+    }
+
     /// Find the SegmentObject at this offset.  If the SegmentObject was in a dropped_* list,
     /// then swap it into the main list and demote whoever previously held that offset.
     /// Calling this for all segments in manifests results in a PartitionObjects whose
@@ -74,6 +96,12 @@ impl PartitionObjects {
                         if dropped_obj.key == expect_key {
                             // Something is wrong with our key parsing if this isn't the case
                             assert_eq!(dropped_obj.base_offset, base_offset);
+
+                            info!(
+                                "Promoting segment object at offset {}: {}",
+                                dropped_obj.base_offset, dropped_obj.key
+                            );
+
                             // Swap the dropped object into segment_objects
                             std::mem::swap(dropped_obj, found);
                             return Some(found);
@@ -102,6 +130,10 @@ impl PartitionObjects {
 
             if let Some(i) = found {
                 let o = self.dropped_objects.remove(i);
+                info!(
+                    "Promoting segment object at offset {}: {}",
+                    o.base_offset, o.key
+                );
                 let replaced = self.segment_objects.insert(o.base_offset, o);
 
                 // We already checked for the expected offset in the earlier branch
@@ -739,6 +771,44 @@ impl BucketReader {
         // partitions they know where deleted+replaced
     }
 
+    pub async fn repair_manifest_ntp(
+        &mut self,
+        gaps: &Vec<MetadataGap>,
+        ntpr: &NTPR,
+    ) -> Result<Vec<RepairEdit>, BucketReaderError> {
+        let initial_repairs = maybe_adjust_manifest(&ntpr, &gaps, self).await?;
+        info!(
+            "[{}] Found {} repairs to manifest, projecting.",
+            ntpr,
+            initial_repairs.len()
+        );
+
+        let objects = if let Some(o) = self.partitions.get_mut(&ntpr) {
+            o
+        } else {
+            return Ok(Vec::new());
+        };
+
+        if let Some(metadata) = self.partition_manifests.get_mut(&ntpr) {
+            if let Some(manifest) = metadata.head_manifest.as_mut() {
+                project_repairs(manifest, &initial_repairs);
+
+                if manifest.segments.is_some() {
+                    for seg in manifest.segments.as_ref().unwrap().values() {
+                        if let Some(segment_key) = manifest.segment_key(seg) {
+                            // Our repair might mean that a segment from the 'dropped' list
+                            // is now referenced by the manifest: use the 'adjust' side effect
+                            // of this function to swap that segment into the main list.:w
+                            objects.get_and_adjust(seg.base_offset as RawOffset, &segment_key);
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(initial_repairs)
+    }
+
     pub async fn analyze_metadata(&mut self, filter: &NTPFilter) -> Result<(), BucketReaderError> {
         // In case caller calls it twice
         self.anomalies = Anomalies::new();
@@ -1205,6 +1275,43 @@ impl BucketReader {
             GetResult::File(_, _) => unreachable!(),
             GetResult::Stream(s) => Ok(s),
         }
+    }
+
+    pub async fn summarize_data_segment(
+        &self,
+        o: &SegmentObject,
+        delta: u64,
+    ) -> Result<SegmentDataSummary, BucketReaderError> {
+        info!("Reading data segment {} ({} bytes)", o.key, o.size_bytes);
+        let head = self
+            .client
+            .head(&object_store::path::Path::from(o.key.as_str()))
+            .await?;
+
+        let mut summary = SegmentDataSummary {
+            size_bytes: head.size as u64,
+            base_offset: i64::MAX,
+            committed_offset: i64::MIN,
+            delta_end: delta,
+        };
+
+        let stream = self.stream_one(&o.key).await?;
+        pin_mut!(stream);
+        let byte_stream = StreamReader::new(stream);
+        let mut batch_stream = BatchStream::new(byte_stream);
+        while let Ok(bb) = batch_stream.read_batch_buffer().await {
+            summary.base_offset =
+                std::cmp::min(summary.base_offset, bb.header.base_offset as RawOffset);
+            summary.committed_offset = std::cmp::max(
+                summary.committed_offset,
+                (bb.header.base_offset + bb.header.record_count as u64 - 1) as RawOffset,
+            );
+            if !bb.header.is_kafka_data() {
+                summary.delta_end += bb.header.record_count as u64;
+            }
+        }
+
+        Ok(summary)
     }
 
     fn decode_partition_manifest(

@@ -423,6 +423,26 @@ impl PartitionManifest {
             None
         }
     }
+
+    // FIXME: slow path because the segment map is indexed by shortname, which
+    // requires caller to know term.  That map key is only there for legacy
+    // json compat.
+    pub fn get_segment_by_offset(
+        &self,
+        base_offset: RawOffset,
+    ) -> Option<&PartitionManifestSegment> {
+        if self.segments.is_none() {
+            return None;
+        }
+
+        for seg in self.segments.as_ref().unwrap().values() {
+            if seg.base_offset == base_offset as u64 {
+                return Some(seg);
+            }
+        }
+
+        None
+    }
 }
 
 fn offset_has_default_value(offset: &Option<i64>) -> bool {

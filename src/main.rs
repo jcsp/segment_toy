@@ -9,6 +9,7 @@ mod error;
 mod fundamental;
 mod ntp_mask;
 mod remote_types;
+mod repair;
 mod varint;
 
 use log::{debug, error, info, trace, warn};
@@ -17,7 +18,9 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionObjects};
+use crate::bucket_reader::{
+    AnomalyStatus, BucketReader, MetadataGap, PartitionObjects, SegmentObject,
+};
 use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
@@ -29,6 +32,10 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 // TODO use the one in futures?
 use crate::error::BucketReaderError;
+use crate::repair::{
+    maybe_adjust_manifest, project_repairs, DataAddNullSegment, ManifestEditAlterSegment,
+    ManifestSegmentDiff, RepairEdit,
+};
 use pin_utils::pin_mut;
 use redpanda_records::RecordBatchType;
 use serde::Serialize;
@@ -55,34 +62,6 @@ impl Display for Backend {
             Backend::Azure => f.write_str("azure"),
         }
     }
-}
-
-#[derive(Serialize)]
-pub struct DataAddNullSegment {
-    key: String,
-    object_key: String,
-    data_records: u64,
-    non_data_records: u64,
-    body: PartitionManifestSegment,
-}
-
-#[derive(Serialize)]
-pub struct ManifestEditAddSegment {
-    key: String,
-    body: PartitionManifestSegment,
-}
-
-#[derive(Serialize)]
-pub struct ManifestEditAlterSegment {
-    key: String,
-    modified_fields: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Serialize)]
-pub enum RepairEdit {
-    AddSegment(ManifestEditAddSegment),
-    AlterSegment(ManifestEditAlterSegment),
-    AddNullSegment(DataAddNullSegment),
 }
 
 #[derive(Parser)]
@@ -324,6 +303,10 @@ impl NTPDataScanResult {
             return true;
         }
 
+        if !self.proposed_repairs.is_empty() {
+            return true;
+        }
+
         false
     }
 
@@ -468,16 +451,23 @@ async fn scan_data_ntp(
 
                     // Take the data as authoritative and correct the metadata
                     let alteration = ManifestEditAlterSegment {
-                        key: segment_shortname(
+                        old_key: segment_shortname(
                             meta_seg.base_offset as RawOffset,
                             meta_seg.segment_term.unwrap() as RaftTerm,
                         ),
-                        modified_fields: HashMap::from([(
-                            "delta_offset".to_string(),
-                            serde_json::Value::Number(serde_json::Number::from(
-                                raw_offset - kafka_offset,
-                            )),
-                        )]),
+                        new_key: segment_shortname(
+                            meta_seg.base_offset as RawOffset,
+                            meta_seg.segment_term.unwrap() as RaftTerm,
+                        ),
+                        diff: ManifestSegmentDiff {
+                            delta_offset: Some((raw_offset - kafka_offset) as u64),
+                            delta_offset_end: None,
+                            base_offset: None,
+                            committed_offset: None,
+                            segment_term: None,
+                            upload_term: None,
+                            size_bytes: None,
+                        },
                     };
                     ntp_report
                         .proposed_repairs
@@ -545,9 +535,6 @@ async fn scan_data_ntp(
             ntp_report.batches += 1;
             ntp_report.bytes += bb.header.size_bytes as u64;
 
-            // TODO; rules for other data types like Tx batches
-            let is_data = bb.header.record_batch_type == RecordBatchType::RaftData as i8;
-
             if bb.header.record_batch_type == RecordBatchType::TxPrepare as i8
                 || bb.header.record_batch_type == RecordBatchType::TxFence as i8
             {
@@ -587,8 +574,8 @@ async fn scan_data_ntp(
                                     && gap_end == curr_seg.base_offset as RawOffset - 1
                                 {
                                     info!(
-                                        "Detected clean data gap betwen segments {} and {}",
-                                        prev_seg.base_offset, curr_seg.base_offset
+                                        "[{}] Detected clean data gap betwen segments {} and {}",
+                                        ntpr, prev_seg.base_offset, curr_seg.base_offset
                                     );
                                     let non_data_records = curr_seg.delta_offset.unwrap_or(0)
                                         as i64
@@ -596,7 +583,7 @@ async fn scan_data_ntp(
                                     let data_records =
                                         (gap_end - gap_begin) + 1 - non_data_records as i64;
                                     if data_records < 0 || non_data_records < 0 {
-                                        warn!("Cannot infer record counts for missing segment, will not repair");
+                                        warn!("[{}] Cannot infer record counts for missing segment, will not repair", ntpr);
                                     } else {
                                         let null_seg = PartitionManifestSegment {
                                             base_offset: gap_begin as u64,
@@ -662,7 +649,7 @@ async fn scan_data_ntp(
                 ntp_report.records += bb.header.record_count as u64;
             }
 
-            if !is_data {
+            if !bb.header.is_kafka_data() {
                 offset_delta += bb.header.record_count as u64;
             } else {
                 kafka_offset += bb.header.record_count as KafkaOffset;
@@ -691,11 +678,18 @@ async fn scan_data_ntp(
 
                 ntp_report.proposed_repairs.push(RepairEdit::AlterSegment(
                     ManifestEditAlterSegment {
-                        key,
-                        modified_fields: HashMap::from([(
-                            "committed_offset".to_string(),
-                            serde_json::Value::Number(serde_json::Number::from(raw_offset - 1)),
-                        )]),
+                        old_key: key.clone(),
+                        new_key: key,
+                        diff: ManifestSegmentDiff {
+                            delta_offset: None,
+                            delta_offset_end: None,
+                            base_offset: None,
+                            committed_offset: Some(raw_offset - 1),
+                            segment_term: None,
+                            upload_term: None,
+                            // TODO: worth checking size_bytes if offset count was wrong
+                            size_bytes: None,
+                        },
                     },
                 ));
             } else if raw_offset - 1 < meta_seg.committed_offset as RawOffset {
@@ -717,17 +711,27 @@ async fn scan_data_ntp(
                     );
                     ntp_report.kafka_offset_mismatch = true;
 
+                    let key = segment_shortname(
+                        meta_seg.base_offset as RawOffset,
+                        meta_seg.segment_term.unwrap() as RaftTerm,
+                    );
+
                     // Take the data as authoritative and correct the metadata
-                    let alteration = ManifestEditAlterSegment {
-                        key: segment_shortname(
-                            meta_seg.base_offset as RawOffset,
-                            meta_seg.segment_term.unwrap() as RaftTerm,
-                        ),
-                        modified_fields: HashMap::from([(
-                            "delta_offset_end".to_string(),
-                            serde_json::Value::Number(serde_json::Number::from(offset_delta)),
-                        )]),
-                    };
+                    ntp_report.proposed_repairs.push(RepairEdit::AlterSegment(
+                        ManifestEditAlterSegment {
+                            old_key: key.clone(),
+                            new_key: key,
+                            diff: ManifestSegmentDiff {
+                                delta_offset: None,
+                                delta_offset_end: Some(offset_delta),
+                                base_offset: None,
+                                committed_offset: None,
+                                segment_term: None,
+                                upload_term: None,
+                                size_bytes: None,
+                            },
+                        },
+                    ));
                 }
             }
         }
@@ -761,19 +765,43 @@ async fn scan_data(
     meta_file: Option<&str>,
     bounds: Option<(RawOffset, RawOffset)>,
 ) -> Result<(), BucketReaderError> {
-    let bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
+    let mut bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
+
+    // Run metadata analysis to get metadata gap detection
+    bucket_reader.analyze_metadata(&cli.filter).await?;
 
     // TODO: wire up the batch/record read to consider any EOFs etc as errors
     // when reading from S3, and set failed=true here
 
     let mut report: BTreeMap<NTPR, NTPDataScanResult> = BTreeMap::new();
 
-    for (ntpr, objects) in &bucket_reader.partitions {
-        if !cli.filter.match_ntpr(ntpr) {
-            continue;
-        }
+    let ntprs: Vec<NTPR> = bucket_reader
+        .partitions
+        .keys()
+        .filter(|k| cli.filter.match_ntpr(k))
+        .map(|k| k.clone())
+        .collect();
 
-        let ntp_report = scan_data_ntp(ntpr, objects, &bucket_reader, bounds).await?;
+    for ntpr in ntprs {
+        let gaps = bucket_reader
+            .anomalies
+            .metadata_offset_gaps
+            .get(&ntpr)
+            .map(|v| v.clone())
+            .unwrap_or(Vec::new());
+
+        let initial_repairs = bucket_reader.repair_manifest_ntp(&gaps, &ntpr).await?;
+
+        let objects = match bucket_reader.partitions.get(&ntpr) {
+            Some(o) => o,
+            None => {
+                // We can't scan data if there isn't any
+                continue;
+            }
+        };
+
+        let mut ntp_report = scan_data_ntp(&ntpr, objects, &bucket_reader, bounds).await?;
+        ntp_report.proposed_repairs.extend(initial_repairs);
 
         report.insert(ntpr.clone(), ntp_report);
     }
@@ -822,18 +850,25 @@ async fn scan_gaps(
     reader.analyze_metadata(&cli.filter).await?;
 
     #[derive(Serialize)]
+    struct GapScanPartitionReport {
+        repairs: Vec<RepairEdit>,
+        gap_scans: Vec<GapScan>,
+    }
+
+    #[derive(Serialize)]
     struct GapScan {
-        ntpr: NTPR,
         gap: MetadataGap,
         scan_result: NTPDataScanResult,
     }
 
-    let mut results: Vec<GapScan> = Vec::new();
+    let mut results: HashMap<NTPR, GapScanPartitionReport> = HashMap::new();
 
     let mut offset_gaps = HashMap::new();
     std::mem::swap(&mut offset_gaps, &mut reader.anomalies.metadata_offset_gaps);
 
     for (ntpr, gaps) in offset_gaps {
+        let initial_repairs = reader.repair_manifest_ntp(&gaps, &ntpr).await?;
+
         let objects = if let Some(o) = reader.partitions.get(&ntpr) {
             o
         } else {
@@ -843,6 +878,12 @@ async fn scan_gaps(
             warn!("[{}] Unexpected: no objects for ntpr reporting gap", ntpr);
             continue;
         };
+
+        let mut partition_report = GapScanPartitionReport {
+            repairs: initial_repairs,
+            gap_scans: vec![],
+        };
+
         for gap in gaps {
             let bounds = if let Some(next_seg) = objects.segment_objects.get(&gap.next_seg_base) {
                 Some((gap.prev_seg_base, next_seg.base_offset + 1))
@@ -854,12 +895,13 @@ async fn scan_gaps(
                 continue;
             };
             let ntp_scan_result = scan_data_ntp(&ntpr, objects, &reader, bounds).await?;
-            results.push(GapScan {
-                ntpr: ntpr.clone(),
+            partition_report.gap_scans.push(GapScan {
                 gap,
                 scan_result: ntp_scan_result,
             });
         }
+
+        results.insert(ntpr.clone(), partition_report);
     }
 
     println!("{}", serde_json::to_string_pretty(&results).unwrap());
