@@ -18,9 +18,11 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionObjects};
-use crate::fundamental::{KafkaOffset, RawOffset, NTPR, NTR};
+use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
-use crate::remote_types::PartitionManifest;
+use crate::remote_types::{
+    segment_shortname, PartitionManifest, PartitionManifestSegment, SegmentNameFormat,
+};
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
 use futures::StreamExt;
@@ -30,6 +32,7 @@ use crate::error::BucketReaderError;
 use pin_utils::pin_mut;
 use redpanda_records::RecordBatchType;
 use serde::Serialize;
+use serde_json::Number;
 use tokio_util::io::StreamReader;
 
 /// Parser for use with `clap` argument parsing
@@ -52,6 +55,34 @@ impl Display for Backend {
             Backend::Azure => f.write_str("azure"),
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct DataAddNullSegment {
+    key: String,
+    object_key: String,
+    data_records: u64,
+    non_data_records: u64,
+    body: PartitionManifestSegment,
+}
+
+#[derive(Serialize)]
+pub struct ManifestEditAddSegment {
+    key: String,
+    body: PartitionManifestSegment,
+}
+
+#[derive(Serialize)]
+pub struct ManifestEditAlterSegment {
+    key: String,
+    modified_fields: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Serialize)]
+pub enum RepairEdit {
+    AddSegment(ManifestEditAddSegment),
+    AlterSegment(ManifestEditAlterSegment),
+    AddNullSegment(DataAddNullSegment),
 }
 
 #[derive(Parser)]
@@ -108,6 +139,8 @@ enum Commands {
         sink: String,
         #[arg(short, long)]
         meta_file: Option<String>,
+        #[arg(short, long, default_value_t = false)]
+        metadata_only: bool,
     },
 }
 
@@ -215,6 +248,9 @@ pub struct NTPDataScanResult {
 
     /// Were any transaction batches seen?
     pub transactions: bool,
+
+    /// Proposed changes to make the partition readable: scan will never make changes itself
+    pub proposed_repairs: Vec<RepairEdit>,
 }
 
 #[derive(Serialize)]
@@ -266,6 +302,7 @@ impl NTPDataScanResult {
             segment_undersized: false,
             compaction: false,
             transactions: false,
+            proposed_repairs: vec![],
         }
     }
 
@@ -399,6 +436,7 @@ async fn scan_data_ntp(
 
     let data_stream = bucket_reader.stream(ntpr, Some(raw_offset));
     pin_mut!(data_stream);
+    let mut prev_segment_meta: Option<PartitionManifestSegment> = None;
     while let Some(segment_stream_struct) = data_stream.next().await {
         let (segment_stream_data_r, segment_obj) = segment_stream_struct.into_parts();
 
@@ -413,6 +451,8 @@ async fn scan_data_ntp(
 
         let byte_stream = StreamReader::new(segment_stream_data);
 
+        let mut current_segment_meta: Option<PartitionManifestSegment> = None;
+
         // Start of segment, compare offset with manifest
         let meta_seg_opt = manifest_opt
             .map(|m| m.get_segment(segment_obj.base_offset, segment_obj.original_term))
@@ -425,12 +465,31 @@ async fn scan_data_ntp(
                             ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
                         );
                     ntp_report.kafka_offset_mismatch = true;
+
+                    // Take the data as authoritative and correct the metadata
+                    let alteration = ManifestEditAlterSegment {
+                        key: segment_shortname(
+                            meta_seg.base_offset as RawOffset,
+                            meta_seg.segment_term.unwrap() as RaftTerm,
+                        ),
+                        modified_fields: HashMap::from([(
+                            "delta_offset".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(
+                                raw_offset - kafka_offset,
+                            )),
+                        )]),
+                    };
+                    ntp_report
+                        .proposed_repairs
+                        .push(RepairEdit::AlterSegment(alteration));
                 }
             }
 
             if meta_seg.is_compacted {
                 ntp_report.compaction = true;
             }
+
+            current_segment_meta = Some(meta_seg.clone());
         } else {
             if let Some(manifest) = manifest_opt {
                 let mut tolerate = false;
@@ -518,9 +577,71 @@ async fn scan_data_ntp(
                             ntpr, raw_offset, header_base_offset
                         );
 
+                        // Propose to fill the gap by creating a segment full of no-op batches
+                        let gap_begin = raw_offset;
+                        let gap_end = (header_base_offset - 1) as RawOffset;
+                        // Is this a "clean" inter-segment gap?
+                        if let Some(prev_seg) = &prev_segment_meta {
+                            if let Some(curr_seg) = &current_segment_meta {
+                                if gap_begin == prev_seg.committed_offset as RawOffset + 1
+                                    && gap_end == curr_seg.base_offset as RawOffset - 1
+                                {
+                                    info!(
+                                        "Detected clean data gap betwen segments {} and {}",
+                                        prev_seg.base_offset, curr_seg.base_offset
+                                    );
+                                    let non_data_records = curr_seg.delta_offset.unwrap_or(0)
+                                        as i64
+                                        - prev_seg.delta_offset.unwrap_or(0) as i64;
+                                    let data_records =
+                                        (gap_end - gap_begin) + 1 - non_data_records as i64;
+                                    if data_records < 0 || non_data_records < 0 {
+                                        warn!("Cannot infer record counts for missing segment, will not repair");
+                                    } else {
+                                        let null_seg = PartitionManifestSegment {
+                                            base_offset: gap_begin as u64,
+                                            committed_offset: gap_end as u64,
+                                            is_compacted: false,
+                                            size_bytes: 0, // Rely on whatever injects the
+                                            // segment to fix this up
+                                            delta_offset: Some(offset_delta as u64),
+                                            delta_offset_end: curr_seg.delta_offset,
+                                            max_timestamp: curr_seg.base_timestamp,
+                                            base_timestamp: prev_seg.max_timestamp,
+                                            ntp_revision: Some(ntpr.revision_id as u64),
+                                            sname_format: curr_seg.sname_format,
+                                            segment_term: curr_seg.segment_term,
+                                            archiver_term: curr_seg.archiver_term,
+                                        };
+
+                                        let key = segment_shortname(
+                                            null_seg.base_offset as RawOffset,
+                                            // FIXME: this will barf on ancient metadata
+                                            null_seg.segment_term.unwrap() as RaftTerm,
+                                        );
+
+                                        // Unwrap safe because we know we have current_segment_meta
+                                        let object_key =
+                                            manifest_opt.unwrap().segment_key(&null_seg).unwrap();
+
+                                        ntp_report.proposed_repairs.push(
+                                            RepairEdit::AddNullSegment(DataAddNullSegment {
+                                                key,
+                                                object_key,
+                                                body: null_seg,
+                                                data_records: data_records as u64,
+                                                non_data_records: non_data_records as u64,
+                                            }),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
                         ntp_report.missing_offsets = true;
                         raw_offset = header_base_offset as RawOffset;
                         kafka_offset = raw_offset - offset_delta as RawOffset;
+                    } else {
                     }
                 }
             };
@@ -561,6 +682,22 @@ async fn scan_data_ntp(
                     segment_obj.key
                 );
                 ntp_report.segment_oversized = true;
+
+                let key = segment_shortname(
+                    meta_seg.base_offset as RawOffset,
+                    // FIXME: this will barf on ancient metadata
+                    meta_seg.segment_term.unwrap() as RaftTerm,
+                );
+
+                ntp_report.proposed_repairs.push(RepairEdit::AlterSegment(
+                    ManifestEditAlterSegment {
+                        key,
+                        modified_fields: HashMap::from([(
+                            "committed_offset".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(raw_offset - 1)),
+                        )]),
+                    },
+                ));
             } else if raw_offset - 1 < meta_seg.committed_offset as RawOffset {
                 warn!(
                     "[{}] Data underruns metadata {} < {} in segment {}",
@@ -580,12 +717,17 @@ async fn scan_data_ntp(
                     );
                     ntp_report.kafka_offset_mismatch = true;
 
-                    // We do not trust the manifest, but to avoid emitting the same
-                    // warning for every subsequent segment, adjust our delta to
-                    // match the manifest: we have already recorded that the metadata
-                    // is damaged.
-                    offset_delta = seg_meta_delta_end;
-                    kafka_offset = raw_offset - offset_delta as RawOffset;
+                    // Take the data as authoritative and correct the metadata
+                    let alteration = ManifestEditAlterSegment {
+                        key: segment_shortname(
+                            meta_seg.base_offset as RawOffset,
+                            meta_seg.segment_term.unwrap() as RaftTerm,
+                        ),
+                        modified_fields: HashMap::from([(
+                            "delta_offset_end".to_string(),
+                            serde_json::Value::Number(serde_json::Number::from(offset_delta)),
+                        )]),
+                    };
                 }
             }
         }
@@ -597,6 +739,8 @@ async fn scan_data_ntp(
             );
             break;
         }
+
+        prev_segment_meta = current_segment_meta;
     }
 
     info!(
@@ -789,6 +933,7 @@ async fn extract(
     source: &str,
     sink: &str,
     meta_file: Option<&str>,
+    metadata_only: bool,
 ) -> Result<(), BucketReaderError> {
     let bucket_reader = make_bucket_reader(cli, source, meta_file).await?;
 
@@ -802,8 +947,6 @@ async fn extract(
             // can have a monolithic metadata file but extract individual partitions
             // on demand
             continue;
-        } else {
-            info!("extract match: {}", ntpr);
         }
 
         let manifest_paths: Vec<object_store::path::Path> = vec!["bin", "json"]
@@ -836,27 +979,29 @@ async fn extract(
         }
     }
 
-    for (ntpr, objects) in bucket_reader.partitions.iter() {
-        if !cli.filter.match_ntpr(ntpr) {
-            continue;
-        } else {
-            info!("extract match: {}", ntpr);
-        }
-
-        for key in objects.all_keys() {
-            info!("Copying {}", key);
-            // TODO; make bucket reader return an object_store::Error?
-            let mut stream = bucket_reader.stream_one(&key).await.unwrap();
-
-            let (_, mut sink_stream) = sink_client
-                .put_multipart(&object_store::path::Path::from(key.as_str()))
-                .await?;
-
-            while let Some(chunk) = stream.next().await {
-                sink_stream.write(chunk.unwrap().as_ref()).await?;
+    if !metadata_only {
+        for (ntpr, objects) in bucket_reader.partitions.iter() {
+            if !cli.filter.match_ntpr(ntpr) {
+                continue;
             }
-            sink_stream.shutdown().await?;
+
+            for key in objects.all_keys() {
+                info!("Copying {}", key);
+                // TODO; make bucket reader return an object_store::Error?
+                let mut stream = bucket_reader.stream_one(&key).await.unwrap();
+
+                let (_, mut sink_stream) = sink_client
+                    .put_multipart(&object_store::path::Path::from(key.as_str()))
+                    .await?;
+
+                while let Some(chunk) = stream.next().await {
+                    sink_stream.write(chunk.unwrap().as_ref()).await?;
+                }
+                sink_stream.shutdown().await?;
+            }
         }
+    } else {
+        info!("Extract: skipping data objects for metadata-only mode");
     }
     Ok(())
 }
@@ -918,8 +1063,16 @@ async fn main() {
             source,
             sink,
             meta_file,
+            metadata_only,
         }) => {
-            let r = extract(&cli, source, sink, meta_file.as_ref().map(|s| s.as_str())).await;
+            let r = extract(
+                &cli,
+                source,
+                sink,
+                meta_file.as_ref().map(|s| s.as_str()),
+                *metadata_only,
+            )
+            .await;
 
             if let Err(e) = r {
                 error!("Error: {:?}", e);

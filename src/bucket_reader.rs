@@ -178,6 +178,8 @@ impl PartitionObjects {
 pub struct MetadataGap {
     pub prev_seg_base: RawOffset,
     pub prev_seg_committed: RawOffset,
+    pub kafka_gap_begin: Option<KafkaOffset>,
+    pub kafka_gap_end: Option<KafkaOffset>,
     pub next_seg_base: RawOffset,
     pub next_seg_ts: Timestamp,
 }
@@ -926,11 +928,20 @@ impl BucketReader {
                                 .metadata_offset_gaps
                                 .entry(ntpr.clone())
                                 .or_insert_with(|| Vec::new());
+
+                            let kafka_gap_begin = last_delta
+                                .map(|d| (last_committed_offset - d as i64) as KafkaOffset);
+                            let kafka_gap_end = segment
+                                .delta_offset
+                                .map(|d| (segment.base_offset - d) as KafkaOffset);
+
                             gap_list.push(MetadataGap {
                                 next_seg_base: segment.base_offset as RawOffset,
                                 next_seg_ts: segment.base_timestamp.unwrap_or(0) as Timestamp,
                                 prev_seg_committed: last_committed_offset,
                                 prev_seg_base: last_base_offset.unwrap(),
+                                kafka_gap_begin,
+                                kafka_gap_end,
                             });
                         } else if (segment.base_offset as RawOffset) < last_committed_offset + 1 {
                             warn!(

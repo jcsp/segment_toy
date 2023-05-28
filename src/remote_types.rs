@@ -43,7 +43,7 @@ struct ColumnReader<A: DeltaAlg + 'static> {
 /// Legagcy manifest JSON format stores segments in maps where the key
 /// is derived from the segment using this mapping.  This is equivalent
 /// to SegmentNameFormat::V1
-fn segment_shortname(base_offset: RawOffset, segment_term: RaftTerm) -> String {
+pub fn segment_shortname(base_offset: RawOffset, segment_term: RaftTerm) -> String {
     format!("{}-{}-v1.log", base_offset, segment_term)
 }
 
