@@ -1194,7 +1194,6 @@ dependencies = [
  "log",
  "num-traits",
  "object_store",
- "pin-utils",
  "redpanda-adl",
  "redpanda-records",
  "regex",

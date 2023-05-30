@@ -1,6 +1,8 @@
 use crate::batch_reader::BatchStream;
 use crate::error::BucketReaderError;
-use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR};
+use crate::fundamental::{
+    raw_to_kafka, KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR,
+};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
     parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
@@ -897,7 +899,7 @@ impl BucketReader {
             let manifest_segments = &partition_manifest.segments;
             for (segment_short_name, segment) in manifest_segments {
                 if let Some(so) = partition_manifest.start_offset {
-                    if segment.committed_offset < so as u64 {
+                    if segment.committed_offset < so {
                         debug!(
                             "Not checking {} {}, it is below start offset",
                             partition_manifest.ntp(),
@@ -978,8 +980,9 @@ impl BucketReader {
 
                 if let Some(last_committed_offset) = last_committed_offset {
                     if segment.base_offset as RawOffset > last_committed_offset + 1 {
-                        let ts = SystemTime::UNIX_EPOCH
-                            .add(Duration::from_millis(segment.base_timestamp.unwrap_or(0)));
+                        let ts = SystemTime::UNIX_EPOCH.add(Duration::from_millis(
+                            segment.base_timestamp.unwrap_or(0) as u64,
+                        ));
                         let dt: chrono::DateTime<Utc> = ts.into();
 
                         warn!(
@@ -1001,7 +1004,7 @@ impl BucketReader {
                             last_delta.map(|d| (last_committed_offset - d as i64) as KafkaOffset);
                         let kafka_gap_end = segment
                             .delta_offset
-                            .map(|d| (segment.base_offset - d) as KafkaOffset);
+                            .map(|d| raw_to_kafka(segment.base_offset, d));
 
                         gap_list.push(MetadataGap {
                             next_seg_base: segment.base_offset as RawOffset,
@@ -1109,7 +1112,7 @@ impl BucketReader {
         // =======
 
         let list_stream = list_parallel(client.as_ref(), 16).await?;
-        pin_utils::pin_mut!(list_stream);
+        pin_mut!(list_stream);
         let mut manifest_keys: Vec<FetchKey> = vec![];
 
         fn maybe_stash_partition_key(keys: &mut Vec<FetchKey>, k: FetchKey, filter: &NTPFilter) {
@@ -1206,7 +1209,7 @@ impl BucketReader {
                     if segment.segment_term.is_none() {
                         let parsed = parse_segment_shortname(segment_shortname);
                         if let Some(parsed) = parsed {
-                            segment.segment_term = Some(parsed.1 as u64);
+                            segment.segment_term = Some(parsed.1);
                         }
                     }
                 }

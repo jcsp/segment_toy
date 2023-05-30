@@ -12,6 +12,14 @@ pub type RaftTerm = i64;
 // Equivalent to model::timestamp
 pub type Timestamp = i64;
 
+// A difference between a RawOffset and a KafkaOffset.  RawOffset is always greater
+// so deltas are always positive.
+pub type DeltaOffset = u64;
+
+pub fn raw_to_kafka(r: RawOffset, d: DeltaOffset) -> KafkaOffset {
+    (r - d as RawOffset) as KafkaOffset
+}
+
 #[derive(Eq, PartialEq, Hash, Debug, Clone, Serialize, Deserialize, Ord, PartialOrd)]
 pub struct NTP {
     pub namespace: String,

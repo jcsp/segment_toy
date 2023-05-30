@@ -219,19 +219,19 @@ async fn rebuild_manifest(
             let next_offset_delta = offset_delta;
 
             let pms = PartitionManifestSegment {
-                base_offset: min_offset.unwrap() as u64,
-                committed_offset: max_offset.unwrap() as u64,
+                base_offset: min_offset.unwrap(),
+                committed_offset: max_offset.unwrap(),
                 is_compacted: compacted,
                 // TODO: cross ref segment's declared size with HEAD of object and sum of
                 // batch sizes, and warn on discrepancies
                 size_bytes: segment.size_bytes as i64,
-                archiver_term: segment.upload_term as u64,
+                archiver_term: segment.upload_term,
                 delta_offset: Some(base_offset_delta as u64),
-                base_timestamp: Some(min_ts.unwrap() as u64),
-                max_timestamp: Some(max_ts.unwrap() as u64),
+                base_timestamp: Some(min_ts.unwrap()),
+                max_timestamp: Some(max_ts.unwrap()),
                 ntp_revision: Some(ntpr.revision_id as u64),
                 sname_format: Some(SegmentNameFormat::V3 as u32),
-                segment_term: Some(segment.original_term as u64),
+                segment_term: Some(segment.original_term),
                 delta_offset_end: Some(next_offset_delta as u64),
             };
 

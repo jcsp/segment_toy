@@ -1,6 +1,6 @@
-use crate::bucket_reader::{BucketReader, MetadataGap, PartitionObjects, SegmentObject};
+use crate::bucket_reader::{BucketReader, MetadataGap, SegmentObject};
 use crate::error::BucketReaderError;
-use crate::fundamental::{RaftTerm, RawOffset, NTPR};
+use crate::fundamental::{DeltaOffset, RaftTerm, RawOffset, NTPR};
 use crate::remote_types::{segment_shortname, PartitionManifest, PartitionManifestSegment};
 use log::{info, warn};
 use serde::Serialize;
@@ -24,12 +24,12 @@ pub struct ManifestEditAddSegment {
 /// field to None.
 #[derive(Serialize)]
 pub struct ManifestSegmentDiff {
-    pub delta_offset: Option<u64>,
-    pub delta_offset_end: Option<u64>,
+    pub delta_offset: Option<DeltaOffset>,
+    pub delta_offset_end: Option<DeltaOffset>,
     pub base_offset: Option<RawOffset>,
     pub committed_offset: Option<RawOffset>,
-    pub segment_term: Option<u64>,
-    pub archiver_term: Option<u64>,
+    pub segment_term: Option<RaftTerm>,
+    pub archiver_term: Option<RaftTerm>,
     pub size_bytes: Option<u64>,
 }
 
@@ -44,11 +44,11 @@ impl ManifestSegmentDiff {
         }
 
         if let Some(v) = self.base_offset {
-            seg.base_offset = v as u64;
+            seg.base_offset = v;
         }
 
         if let Some(v) = self.committed_offset {
-            seg.committed_offset = v as u64;
+            seg.committed_offset = v;
         }
 
         if let Some(v) = self.segment_term {
@@ -206,8 +206,8 @@ pub async fn maybe_adjust_manifest(
                             base_offset: Some(replacement.base_offset as RawOffset),
                             committed_offset: Some(ground_truth.committed_offset as RawOffset),
                             size_bytes: Some(ground_truth.size_bytes),
-                            segment_term: Some(replacement.original_term as u64),
-                            archiver_term: Some(replacement.upload_term as u64),
+                            segment_term: Some(replacement.original_term),
+                            archiver_term: Some(replacement.upload_term),
                         },
                     };
                     repairs.push(RepairEdit::AlterSegment(alteration));

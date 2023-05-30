@@ -18,28 +18,21 @@ use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::bucket_reader::{
-    AnomalyStatus, BucketReader, MetadataGap, PartitionObjects, SegmentObject,
-};
-use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
+use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionObjects};
+use crate::error::BucketReaderError;
+use crate::fundamental::{raw_to_kafka, KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
-use crate::remote_types::{
-    segment_shortname, PartitionManifest, PartitionManifestSegment, SegmentNameFormat,
+use crate::remote_types::{segment_shortname, PartitionManifest, PartitionManifestSegment};
+use crate::repair::{
+    DataAddNullSegment, ManifestEditAlterSegment, ManifestSegmentDiff, RepairEdit,
 };
 use batch_reader::BatchStream;
 use clap::{Parser, Subcommand};
+use futures::pin_mut;
 use futures::StreamExt;
 use object_store::ObjectStore;
-// TODO use the one in futures?
-use crate::error::BucketReaderError;
-use crate::repair::{
-    maybe_adjust_manifest, project_repairs, DataAddNullSegment, ManifestEditAlterSegment,
-    ManifestSegmentDiff, RepairEdit,
-};
-use pin_utils::pin_mut;
 use redpanda_records::RecordBatchType;
 use serde::Serialize;
-use serde_json::Number;
 use tokio_util::io::StreamReader;
 
 /// Parser for use with `clap` argument parsing
@@ -414,9 +407,6 @@ async fn scan_data_ntp(
     let status_interval = std::time::Duration::from_secs(10);
     let mut last_status = std::time::SystemTime::now();
 
-    let meta_start_raw_offset = raw_offset;
-    let meta_start_kafka_offset = kafka_offset;
-
     let data_stream = bucket_reader.stream(ntpr, Some(raw_offset));
     pin_mut!(data_stream);
     let mut prev_segment_meta: Option<PartitionManifestSegment> = None;
@@ -442,8 +432,8 @@ async fn scan_data_ntp(
             .unwrap_or(None);
         if let Some(meta_seg) = meta_seg_opt {
             if let Some(seg_meta_delta) = meta_seg.delta_offset {
-                let seg_meta_kafka_base = meta_seg.base_offset - seg_meta_delta;
-                if seg_meta_kafka_base != kafka_offset as u64 {
+                let seg_meta_kafka_base = raw_to_kafka(meta_seg.base_offset, seg_meta_delta);
+                if seg_meta_kafka_base != kafka_offset {
                     warn!("[{}] Offset translation issue!  At offset {}, but segment meta says {} (segment {})",
                             ntpr, kafka_offset, seg_meta_kafka_base, segment_obj.key
                         );
@@ -586,8 +576,8 @@ async fn scan_data_ntp(
                                         warn!("[{}] Cannot infer record counts for missing segment, will not repair", ntpr);
                                     } else {
                                         let null_seg = PartitionManifestSegment {
-                                            base_offset: gap_begin as u64,
-                                            committed_offset: gap_end as u64,
+                                            base_offset: gap_begin,
+                                            committed_offset: gap_end,
                                             is_compacted: false,
                                             size_bytes: 0, // Rely on whatever injects the
                                             // segment to fix this up

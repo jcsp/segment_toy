@@ -1,5 +1,7 @@
 use crate::error::BucketReaderError;
-use crate::fundamental::{KafkaOffset, RaftTerm, RawOffset, NTP, NTPR};
+use crate::fundamental::{
+    raw_to_kafka, DeltaOffset, KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR,
+};
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
 use lazy_static::lazy_static;
@@ -13,26 +15,26 @@ use xxhash_rust::xxh32::xxh32;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PartitionManifestSegment {
     // Mandatory fields: always set, since v22.1.x
-    pub base_offset: u64,
-    pub committed_offset: u64,
+    pub base_offset: RawOffset,
+    pub committed_offset: RawOffset,
     pub is_compacted: bool,
     pub size_bytes: i64,
-    pub archiver_term: u64,
+    pub archiver_term: RaftTerm,
 
     // Since v22.1.x, only set if non-default value
-    pub delta_offset: Option<u64>,
-    pub base_timestamp: Option<u64>,
-    pub max_timestamp: Option<u64>,
+    pub delta_offset: Option<DeltaOffset>,
+    pub base_timestamp: Option<Timestamp>,
+    pub max_timestamp: Option<Timestamp>,
     pub ntp_revision: Option<u64>,
 
     // Since v22.3.x, only set if != to segment_name_format::v1
     pub sname_format: Option<u32>,
 
     // Since v22.3.x, always set.
-    pub segment_term: Option<u64>,
+    pub segment_term: Option<RaftTerm>,
 
     // Since v22.3.x, only set if sname_format==segment_name_format::v2
-    pub delta_offset_end: Option<u64>,
+    pub delta_offset_end: Option<DeltaOffset>,
 }
 
 struct ColumnReader<A: DeltaAlg + 'static> {
@@ -271,17 +273,17 @@ pub fn decode_colstore(
         segment_map.insert(
             shortname,
             PartitionManifestSegment {
-                base_offset: seg_base_offset as u64,
-                committed_offset: committed_offset.get(i) as u64,
+                base_offset: seg_base_offset,
+                committed_offset: committed_offset.get(i),
                 is_compacted: is_compacted.get(i) == 1,
                 size_bytes: size_bytes.get(i),
-                archiver_term: archiver_term.get(i) as u64,
-                delta_offset: Some(delta_offset.get(i) as u64),
-                base_timestamp: Some(base_timestamp.get(i) as u64),
-                max_timestamp: Some(max_timestamp.get(i) as u64),
+                archiver_term: archiver_term.get(i),
+                delta_offset: Some(delta_offset.get(i) as DeltaOffset),
+                base_timestamp: Some(base_timestamp.get(i)),
+                max_timestamp: Some(max_timestamp.get(i)),
                 ntp_revision: Some(ntp_revision.get(i) as u64),
                 sname_format: Some(sname_format.get(i) as u32),
-                segment_term: Some(seg_segment_term as u64),
+                segment_term: Some(seg_segment_term),
                 delta_offset_end: Some(delta_offset_end.get(i) as u64),
             },
         );
@@ -371,7 +373,10 @@ impl PartitionManifest {
 
             (
                 base_segment.base_offset as RawOffset,
-                (base_segment.base_offset - base_segment.delta_offset.unwrap_or(0)) as KafkaOffset,
+                raw_to_kafka(
+                    base_segment.base_offset,
+                    base_segment.delta_offset.unwrap_or(0),
+                ),
             )
         }
     }
@@ -386,8 +391,8 @@ impl PartitionManifest {
             if first.delta_offset.is_none() || last.delta_offset_end.is_none() {
                 None
             } else {
-                let lwm = first.base_offset - first.delta_offset.unwrap();
-                let hwm = last.committed_offset + 1 - last.delta_offset_end.unwrap();
+                let lwm = raw_to_kafka(first.base_offset, first.delta_offset.unwrap());
+                let hwm = raw_to_kafka(last.committed_offset + 1, last.delta_offset_end.unwrap());
                 Some((lwm as KafkaOffset, hwm as KafkaOffset))
             }
         }
@@ -426,7 +431,7 @@ impl PartitionManifest {
         base_offset: RawOffset,
     ) -> Option<&PartitionManifestSegment> {
         for seg in self.segments.values() {
-            if seg.base_offset == base_offset as u64 {
+            if seg.base_offset == base_offset {
                 return Some(seg);
             }
         }
