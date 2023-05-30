@@ -246,36 +246,34 @@ async fn rebuild_manifest(
                     "Trying to infer offset delta for {} from existing manifest...",
                     ntpr
                 );
-                if let Some(original_segments) = &original_manifest.segments {
-                    let mut original_segments: Vec<&PartitionManifestSegment> = original_segments
-                        .values()
-                        .filter(|s| s.delta_offset.is_some())
-                        .collect();
-                    original_segments.sort_by_key(|s| s.base_offset);
+                let original_segments = &original_manifest.segments;
+                let mut original_segments: Vec<&PartitionManifestSegment> = original_segments
+                    .values()
+                    .filter(|s| s.delta_offset.is_some())
+                    .collect();
+                original_segments.sort_by_key(|s| s.base_offset);
 
-                    let hint_segment = original_segments.get(0).unwrap();
-                    let delta_hint = (hint_segment.base_offset, hint_segment.delta_offset.unwrap());
+                let hint_segment = original_segments.get(0).unwrap();
+                let delta_hint = (hint_segment.base_offset, hint_segment.delta_offset.unwrap());
 
-                    let mut delta_adjustment: Option<i64> = None;
-                    for segment in manifest.segments.as_ref().unwrap().values() {
-                        if segment.base_offset == delta_hint.0 {
-                            delta_adjustment =
-                                Some(delta_hint.1 as i64 - segment.delta_offset.unwrap() as i64);
-                            info!(
-                                "Discovered partition {} delta {}",
-                                ntpr,
-                                delta_adjustment.unwrap()
-                            );
-                            break;
-                        }
+                let mut delta_adjustment: Option<i64> = None;
+                for segment in manifest.segments.values() {
+                    if segment.base_offset == delta_hint.0 {
+                        delta_adjustment =
+                            Some(delta_hint.1 as i64 - segment.delta_offset.unwrap() as i64);
+                        info!(
+                            "Discovered partition {} delta {}",
+                            ntpr,
+                            delta_adjustment.unwrap()
+                        );
+                        break;
                     }
+                }
 
-                    if let Some(delta_adjustment) = delta_adjustment {
-                        for segment in manifest.segments.as_mut().unwrap().values_mut() {
-                            *(segment.delta_offset.as_mut().unwrap()) += delta_adjustment as u64;
-                            *(segment.delta_offset_end.as_mut().unwrap()) +=
-                                delta_adjustment as u64;
-                        }
+                if let Some(delta_adjustment) = delta_adjustment {
+                    for segment in manifest.segments.values_mut() {
+                        *(segment.delta_offset.as_mut().unwrap()) += delta_adjustment as u64;
+                        *(segment.delta_offset_end.as_mut().unwrap()) += delta_adjustment as u64;
                     }
                 }
             }

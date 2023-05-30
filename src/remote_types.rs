@@ -317,7 +317,8 @@ pub struct PartitionManifest {
     // Since v22.1.x, only Some if collection has length >= 1
     // `segments` is logically a vector, but stored as a map for convenient conversion with
     // legacy JSON encoding which uses a map.
-    pub segments: Option<HashMap<String, PartitionManifestSegment>>,
+    #[serde(default)]
+    pub segments: HashMap<String, PartitionManifestSegment>,
 
     // >> Since v22.3.x, only set if non-default value
     #[serde(skip_serializing_if = "offset_has_default_value")]
@@ -346,11 +347,10 @@ pub struct PartitionManifest {
 impl PartitionManifest {
     fn get_sorted_segments(&self) -> Vec<&PartitionManifestSegment> {
         // TODO we should just hold segments in sorted order (currently a hashmap)
-        if self.segments.is_none() || self.segments.as_ref().unwrap().is_empty() {
+        if self.segments.is_empty() {
             vec![]
         } else {
-            let mut segments: Vec<&PartitionManifestSegment> =
-                self.segments.as_ref().unwrap().values().collect();
+            let mut segments: Vec<&PartitionManifestSegment> = self.segments.values().collect();
             segments.sort_by_key(|s| s.base_offset);
             segments
         }
@@ -402,10 +402,8 @@ impl PartitionManifest {
             }
         } else {
             let mut n: u64 = 0;
-            if let Some(segments) = &self.segments {
-                for s in segments.values() {
-                    n += s.size_bytes as u64;
-                }
+            for s in self.segments.values() {
+                n += s.size_bytes as u64;
             }
             n
         }
@@ -417,11 +415,7 @@ impl PartitionManifest {
         segment_term: RaftTerm,
     ) -> Option<&PartitionManifestSegment> {
         let shortname = segment_shortname(base_offset, segment_term);
-        if let Some(segments) = &self.segments {
-            segments.get(shortname.as_str())
-        } else {
-            None
-        }
+        self.segments.get(shortname.as_str())
     }
 
     // FIXME: slow path because the segment map is indexed by shortname, which
@@ -431,11 +425,7 @@ impl PartitionManifest {
         &self,
         base_offset: RawOffset,
     ) -> Option<&PartitionManifestSegment> {
-        if self.segments.is_none() {
-            return None;
-        }
-
-        for seg in self.segments.as_ref().unwrap().values() {
+        for seg in self.segments.values() {
             if seg.base_offset == base_offset as u64 {
                 return Some(seg);
             }
@@ -585,7 +575,7 @@ impl PartitionManifest {
             partition: ntpr.ntp.partition_id,
             revision: ntpr.revision_id,
             last_offset: 0,
-            segments: Some(HashMap::new()),
+            segments: HashMap::new(),
             insync_offset: None,
             last_uploaded_compacted_offset: Some(i64::MIN),
             start_offset: None,
@@ -630,11 +620,7 @@ impl PartitionManifest {
             *(self.cloud_log_size_bytes.as_mut().unwrap()) += segment.size_bytes as u64;
         }
 
-        // Method should only be used on manifest constructed with new()
-        assert!(self.segments.is_some());
-
-        let segments = self.segments.as_mut().unwrap();
-        let replaced = segments.insert(shortname, segment);
+        let replaced = self.segments.insert(shortname, segment);
 
         // Caller is responsible for managing any colliding segments, if they are
         // passed into this function then the result would be a corrupt manifest.
@@ -643,11 +629,7 @@ impl PartitionManifest {
     }
 
     pub fn contains_segment_shortname(&self, short_name: &str) -> bool {
-        if let Some(segs) = &self.segments {
-            segs.contains_key(short_name)
-        } else {
-            false
-        }
+        self.segments.contains_key(short_name)
     }
 
     pub fn from_bytes(bytes: bytes::Bytes) -> Result<Self, BucketReaderError> {
@@ -701,7 +683,7 @@ impl PartitionManifest {
             partition,
             revision,
             last_offset,
-            segments: Some(segments),
+            segments,
             replaced: Some(replaced_map),
             insync_offset: Some(insync_offset),
             last_uploaded_compacted_offset: Some(last_uploaded_compacted_offset),
@@ -882,7 +864,7 @@ mod tests {
     async fn test_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest.json").await;
         assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.segments.unwrap().len(), 3);
+        assert_eq!(manifest.segments.len(), 3);
         assert_eq!(manifest.start_offset.unwrap(), 3795);
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "tiered");
@@ -894,7 +876,7 @@ mod tests {
     async fn test_empty_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest_empty.json").await;
         assert_eq!(manifest.version, 1);
-        assert!(manifest.segments.is_none());
+        assert!(manifest.segments.is_empty());
         assert_eq!(manifest.start_offset, None);
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "acme-ticker-cd-s");
@@ -906,7 +888,7 @@ mod tests {
     async fn test_nocompact_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest_nocompact.json").await;
         assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.segments.unwrap().len(), 4);
+        assert_eq!(manifest.segments.len(), 4);
         assert_eq!(manifest.start_offset.unwrap(), 0);
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "acme-ticker-d-d");
@@ -918,7 +900,7 @@ mod tests {
     async fn test_short_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest_short.json").await;
         assert_eq!(manifest.version, 1);
-        assert!(manifest.segments.is_none());
+        assert!(manifest.segments.is_empty());
         assert_eq!(manifest.start_offset, None);
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "si_test_topic");
@@ -930,7 +912,7 @@ mod tests {
     async fn test_no_maxa_timestamp_manifest_decode() {
         let manifest = read_manifest("/resources/test/manifest_no_max_timestamp.json").await;
         assert_eq!(manifest.version, 1);
-        assert_eq!(manifest.segments.unwrap().len(), 30);
+        assert_eq!(manifest.segments.len(), 30);
         assert_eq!(manifest.start_offset, Some(0));
         assert_eq!(manifest.namespace, "kafka");
         assert_eq!(manifest.topic, "panda-topic");
@@ -963,7 +945,7 @@ mod tests {
         assert_eq!(manifest.topic, "test");
         assert_eq!(manifest.partition, 0);
         assert_eq!(manifest.revision, 8);
-        assert_eq!(manifest.segments.unwrap().len(), 3654);
+        assert_eq!(manifest.segments.len(), 3654);
     }
 
     #[test_log::test(tokio::test)]
@@ -979,9 +961,11 @@ mod tests {
         assert_eq!(manifest.revision, 51);
 
         // Reproducer for issue with DeltaFOR decode
-        let segments = manifest.segments.unwrap();
-        assert_eq!(segments.len(), 97);
-        assert_eq!(segments.get("1225-1-v1.log").unwrap().size_bytes, 1573496)
+        assert_eq!(manifest.segments.len(), 97);
+        assert_eq!(
+            manifest.segments.get("1225-1-v1.log").unwrap().size_bytes,
+            1573496
+        )
     }
 
     #[test_log::test(tokio::test)]

@@ -87,7 +87,7 @@ pub fn project_repairs(manifest: &mut PartitionManifest, repairs: &Vec<RepairEdi
             RepairEdit::AddNullSegment(_) => todo!(),
             RepairEdit::AlterSegment(alter) => {
                 // TODO: make safer against empty segments
-                let segments = manifest.segments.as_mut().unwrap();
+                let segments = &mut manifest.segments;
                 let mut value = segments.remove(&alter.old_key).unwrap();
                 alter.diff.apply(&mut value);
                 segments.insert(alter.new_key.clone(), value);
