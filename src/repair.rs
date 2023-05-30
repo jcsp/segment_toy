@@ -29,7 +29,7 @@ pub struct ManifestSegmentDiff {
     pub base_offset: Option<RawOffset>,
     pub committed_offset: Option<RawOffset>,
     pub segment_term: Option<u64>,
-    pub upload_term: Option<u64>,
+    pub archiver_term: Option<u64>,
     pub size_bytes: Option<u64>,
 }
 
@@ -55,7 +55,7 @@ impl ManifestSegmentDiff {
             seg.segment_term = Some(v);
         }
 
-        if let Some(v) = self.upload_term {
+        if let Some(v) = self.archiver_term {
             seg.archiver_term = v;
         }
 
@@ -161,7 +161,7 @@ pub async fn maybe_adjust_manifest(
                     base_offset: None,
                     delta_offset: None,
                     segment_term: None,
-                    upload_term: None,
+                    archiver_term: None,
                 },
             };
             repairs.push(RepairEdit::AlterSegment(alteration));
@@ -207,7 +207,7 @@ pub async fn maybe_adjust_manifest(
                             committed_offset: Some(ground_truth.committed_offset as RawOffset),
                             size_bytes: Some(ground_truth.size_bytes),
                             segment_term: Some(replacement.original_term as u64),
-                            upload_term: Some(replacement.upload_term as u64),
+                            archiver_term: Some(replacement.upload_term as u64),
                         },
                     };
                     repairs.push(RepairEdit::AlterSegment(alteration));

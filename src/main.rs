@@ -465,7 +465,7 @@ async fn scan_data_ntp(
                             base_offset: None,
                             committed_offset: None,
                             segment_term: None,
-                            upload_term: None,
+                            archiver_term: None,
                             size_bytes: None,
                         },
                     };
@@ -686,7 +686,7 @@ async fn scan_data_ntp(
                             base_offset: None,
                             committed_offset: Some(raw_offset - 1),
                             segment_term: None,
-                            upload_term: None,
+                            archiver_term: None,
                             // TODO: worth checking size_bytes if offset count was wrong
                             size_bytes: None,
                         },
@@ -727,7 +727,7 @@ async fn scan_data_ntp(
                                 base_offset: None,
                                 committed_offset: None,
                                 segment_term: None,
-                                upload_term: None,
+                                archiver_term: None,
                                 size_bytes: None,
                             },
                         },
