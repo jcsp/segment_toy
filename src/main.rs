@@ -22,7 +22,9 @@ use crate::bucket_reader::{AnomalyStatus, BucketReader, MetadataGap, PartitionOb
 use crate::error::BucketReaderError;
 use crate::fundamental::{raw_to_kafka, KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
-use crate::remote_types::{segment_shortname, PartitionManifest, PartitionManifestSegment};
+use crate::remote_types::{
+    segment_shortname, PartitionManifest, PartitionManifestSegment, TopicManifest,
+};
 use crate::repair::{
     DataAddNullSegment, ManifestEditAlterSegment, ManifestSegmentDiff, RepairEdit,
 };
@@ -1009,6 +1011,18 @@ async fn extract(
                 }
             };
         }
+    }
+
+    for (ntr, tp_man) in &bucket_reader.topic_manifests {
+        if !cli.filter.match_ntr(ntr) {
+            continue;
+        }
+
+        let path =
+            object_store::path::Path::from(TopicManifest::manifest_key(&ntr.namespace, &ntr.topic));
+        let mut get_r = bucket_reader.client.get(&path).await?;
+        let bytes = get_r.bytes().await?;
+        sink_client.put(&path, bytes).await?;
     }
 
     if !metadata_only {

@@ -834,6 +834,16 @@ pub struct TopicManifest {
     pub retention_duration: Option<u64>,
 }
 
+impl TopicManifest {
+    pub fn manifest_key(ns: &str, topic: &str) -> String {
+        let path = format!("{}/{}", ns, topic);
+        let hash = xxh32(path.as_bytes(), 0);
+        let bitmask = 0xf0000000;
+
+        format!("{:08x}/meta/{}/topic_manifest.json", hash & bitmask, path)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
