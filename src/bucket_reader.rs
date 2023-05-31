@@ -256,6 +256,8 @@ pub struct Anomalies {
     /// used to cue subsequent data scans.
     /// Ref Incident 259
     pub metadata_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
+
+    pub ntpr_issue_10782: HashSet<NTPR>,
 }
 /// A convenience for human beings who would like to know things like the total amount of
 /// data in each partition
@@ -395,6 +397,7 @@ impl Anomalies {
             ntpr_bad_deltas: HashSet::new(),
             ntpr_overlap_offsets: HashSet::new(),
             metadata_offset_gaps: HashMap::new(),
+            ntpr_issue_10782: HashSet::new(),
         }
     }
 }
@@ -963,6 +966,22 @@ impl BucketReader {
                                 self.anomalies.ntpr_bad_deltas.insert(ntpr.clone());
                             }
                         }
+                    }
+                }
+
+                if let Some(delta_end) = segment.delta_offset_end {
+                    // Segments with last_delta may be vulnerable to an issue
+                    // in buggy readers (Redpanda <= 22.3.20)
+                    // https://github.com/redpanda-data/redpanda/pull/10782
+                    let base_kafka_offset =
+                        raw_to_kafka(segment.base_offset, segment.delta_offset.unwrap());
+                    let next_kafka_offset = raw_to_kafka(segment.committed_offset, delta_end) + 1;
+                    if next_kafka_offset - 1 == base_kafka_offset {
+                        warn!(
+                            "[{}] Segment {} vulnerable to Issue #10782 at kafka offset {} (next kafka {})",
+                            ntpr, segment.base_offset, base_kafka_offset, next_kafka_offset
+                        );
+                        self.anomalies.ntpr_issue_10782.insert(ntpr.clone());
                     }
                 }
 
