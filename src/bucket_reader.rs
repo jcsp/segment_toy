@@ -1325,6 +1325,42 @@ impl BucketReader {
         }
     }
 
+    pub async fn inject_partition_manifest(
+        &mut self,
+        // Path is not an object path: it's a filename, only used to figure out if
+        // the input is meant to be binary or JSON based on extension
+        path: &str,
+        body: bytes::Bytes,
+    ) {
+        // Decode it to derive the key
+        let manifest = match Self::decode_partition_manifest(path, body.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                panic!("Error parsing partition manifest {}: {:?}", path, e);
+            }
+        };
+
+        let extension = if path.ends_with(".bin") {
+            ".bin"
+        } else {
+            ".json"
+        };
+
+        let key = PartitionManifest::manifest_key(
+            &NTPR {
+                ntp: NTP {
+                    namespace: manifest.namespace,
+                    topic: manifest.topic,
+                    partition_id: manifest.partition,
+                },
+                revision_id: manifest.revision,
+            },
+            extension,
+        );
+
+        self.ingest_partition_manifest(&key, body).await.unwrap()
+    }
+
     async fn ingest_partition_manifest(
         &mut self,
         key: &str,

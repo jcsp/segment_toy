@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
 use crate::batch_reader::DumpError;
 use crate::batch_writer::reserialize_batch;
@@ -103,6 +103,8 @@ enum Commands {
         meta_in: String,
         #[arg(short, long)]
         meta_out: String,
+        #[arg(short, long)]
+        inject_manifest_path: Option<String>,
     },
 }
 
@@ -111,11 +113,23 @@ async fn filter_metadata(
     source: &str,
     meta_in: &str,
     meta_out: &str,
+    inject_manifest_path: Option<&str>,
 ) -> Result<(), BucketReaderError> {
     info!("Loading metadata from {}...", meta_in);
 
     let mut bucket_reader = make_bucket_reader(cli, source, Some(meta_in)).await;
     bucket_reader.filter(&cli.filter);
+
+    if let Some(p) = inject_manifest_path {
+        info!("Injecting manifest from {}...", p);
+        let mut file = File::open(p).await.unwrap();
+        let mut buf: String = String::new();
+        file.read_to_string(&mut buf).await?;
+        bucket_reader
+            .inject_partition_manifest(&p, bytes::Bytes::from(buf))
+            .await;
+    }
+
     bucket_reader.to_file(meta_out).await?;
     Ok(())
 }
@@ -563,10 +577,17 @@ async fn main() {
             source,
             meta_in,
             meta_out,
+            inject_manifest_path,
         }) => {
-            filter_metadata(&cli, source, meta_in, meta_out)
-                .await
-                .unwrap();
+            filter_metadata(
+                &cli,
+                source,
+                meta_in,
+                meta_out,
+                inject_manifest_path.as_ref().map(|s| s.as_str()),
+            )
+            .await
+            .unwrap();
         }
         None => {}
     }
