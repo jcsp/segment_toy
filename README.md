@@ -80,3 +80,21 @@ For example, to use the tool with a bucket called `data` in a minio cluster at `
 
     AWS_ALLOW_HTTP=1 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
       AWS_ENDPOINT=http://aplite:9000 cargo run --bin=rp-storage-tool --release -- --backend aws scan --source data
+
+### Building a portable binary
+
+If you are building on a workstation and copying the binary to a remote machine, and your
+workstation doesn't happen to run the same linux distro as the remote machine, it is
+useful to build a statically linked binary that will work on any distro.
+
+    # A dependency requires this to build: adjust as needed if not on an RPM distro
+    sudo dnf install -y musl-gcc
+
+    # Install the Rust toolchain for musl (statically linked libc)
+    rustup target add x86_64-unknown-linux-musl
+
+    # Build with the musl toolchain
+    cargo build --release --target=x86_64-unknown-linux-musl
+
+    # Output in target/release/rp-storage-tool
+
