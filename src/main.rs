@@ -1013,14 +1013,14 @@ async fn extract(
         }
     }
 
-    for (ntr, tp_man) in &bucket_reader.topic_manifests {
+    for (ntr, _tp_man) in &bucket_reader.topic_manifests {
         if !cli.filter.match_ntr(ntr) {
             continue;
         }
 
         let path =
             object_store::path::Path::from(TopicManifest::manifest_key(&ntr.namespace, &ntr.topic));
-        let mut get_r = bucket_reader.client.get(&path).await?;
+        let get_r = bucket_reader.client.get(&path).await?;
         let bytes = get_r.bytes().await?;
         sink_client.put(&path, bytes).await?;
     }
