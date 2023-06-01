@@ -3,6 +3,10 @@ name = "segments"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+unstable = []
+
 [dependencies]
 tokio = { version = "1.21.2", features = ["full"] }
 log = "0.4.17"
@@ -37,6 +41,7 @@ path = "src/main.rs"
 [[bin]]
 name = "rp-storage-tool-unstable"
 path = "src/main_unstable.rs"
+required-features = ["unstable"]
 
 [dependencies.redpanda-adl]
 path = "redpanda-adl"
