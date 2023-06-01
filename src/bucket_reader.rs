@@ -5,7 +5,7 @@ use crate::fundamental::{
 };
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
-    parse_segment_shortname, ArchivePartitionManifest, PartitionManifest, PartitionManifestSegment,
+    parse_segment_shortname, ArchivePartitionManifest, ClusterMetadataManifest, PartitionManifest, PartitionManifestSegment,
     TopicManifest,
 };
 use crate::repair::{maybe_adjust_manifest, project_repairs, RepairEdit};
@@ -256,6 +256,12 @@ pub struct Anomalies {
     /// used to cue subsequent data scans.
     /// Ref Incident 259
     pub metadata_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
+
+    /// ClusterMetadataManifest that could not be loaded
+    pub malformed_cluster_manifests: Vec<String>,
+
+    /// Controller snapshot that could not be loaded
+    pub malformed_controller_snapshot: Vec<String>,
 }
 /// A convenience for human beings who would like to know things like the total amount of
 /// data in each partition
@@ -395,6 +401,8 @@ impl Anomalies {
             ntpr_bad_deltas: HashSet::new(),
             ntpr_overlap_offsets: HashSet::new(),
             metadata_offset_gaps: HashMap::new(),
+            malformed_cluster_manifests: vec![],
+            malformed_controller_snapshot: vec![],
         }
     }
 }
@@ -469,11 +477,18 @@ async fn list_parallel<'a>(
     })
 }
 
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct ClusterMetadata {
+    pub manifests: BTreeMap<i64, ClusterMetadataManifest>,
+    pub controller_snapshots: HashSet<String>,
+}
+
 /// Find all the partitions and their segments within a bucket
 pub struct BucketReader {
     pub partitions: HashMap<NTPR, PartitionObjects>,
     pub partition_manifests: HashMap<NTPR, PartitionMetadata>,
     pub topic_manifests: HashMap<NTR, TopicManifest>,
+    pub cluster_metadata: HashMap<String, ClusterMetadata>,
     pub anomalies: Anomalies,
     pub client: Arc<dyn ObjectStore>,
 }
@@ -483,6 +498,7 @@ struct SavedBucketReader {
     pub partitions: HashMap<NTPR, PartitionObjects>,
     pub partition_manifests: HashMap<NTPR, PartitionMetadata>,
     pub topic_manifests: HashMap<NTR, TopicManifest>,
+    pub cluster_metadata: HashMap<String, ClusterMetadata>,
 }
 
 pub struct SegmentStream {
@@ -532,6 +548,7 @@ impl BucketReader {
             partition_manifests: saved_state.partition_manifests,
             topic_manifests: saved_state.topic_manifests,
             anomalies: Anomalies::new(),
+            cluster_metadata: saved_state.cluster_metadata,
             client,
         })
     }
@@ -561,6 +578,7 @@ impl BucketReader {
             partitions: self.partitions.clone(),
             partition_manifests: self.partition_manifests.clone(),
             topic_manifests: self.topic_manifests.clone(),
+            cluster_metadata: self.cluster_metadata.clone(),
         };
 
         let buf = serde_json::to_vec(&saved_state).unwrap();
@@ -576,6 +594,7 @@ impl BucketReader {
             partitions: HashMap::new(),
             partition_manifests: HashMap::new(),
             topic_manifests: HashMap::new(),
+            cluster_metadata: HashMap::new(),
             anomalies: Anomalies::new(),
             client,
         }
@@ -1173,6 +1192,12 @@ impl BucketReader {
                 );
             } else if key.ends_with("/topic_manifest.json") {
                 maybe_stash_topic_key(&mut manifest_keys, FetchKey::TopicManifest(key), filter);
+            } else if key.ends_with("cluster_manifest.json") {
+                debug!("Parsing cluster metadata manifest key {}", key);
+                self.ingest_cluster_metadata_manifest(&key).await?;
+            } else if key.ends_with("controller.snapshot") {
+                debug!("Parsing controller snapshot key {}", key);
+                self.ingest_controller_snapshot(&key);
             } else if key.contains("manifest.json.") || key.contains("manifest.bin.") {
                 maybe_stash_partition_key(
                     &mut manifest_keys,
@@ -1456,6 +1481,65 @@ impl BucketReader {
         } else {
             warn!("Malformed partition archive manifest key {}", key);
             self.anomalies.malformed_manifests.push(key.to_string());
+        }
+        Ok(())
+    }
+
+    fn ingest_controller_snapshot(&mut self, key: &str) {
+        lazy_static! {
+            static ref CONTROLLER_SNAPSHOT_KEY: Regex =
+                Regex::new("cluster_metadata/([-a-f0-9]+)/[^]]+/controller.snapshot").unwrap();
+        }
+        if let Some(grps) = CONTROLLER_SNAPSHOT_KEY.captures(key) {
+            let cluster_uuid = grps.get(1).unwrap().as_str().to_string();
+            let cluster_meta = self.cluster_metadata.entry(cluster_uuid).or_default();
+            cluster_meta.controller_snapshots.insert(key.to_string());
+        } else {
+            self.anomalies
+                .malformed_controller_snapshot
+                .push(key.to_string());
+        }
+    }
+
+    async fn ingest_cluster_metadata_manifest(
+        &mut self,
+        key: &str,
+    ) -> Result<(), BucketReaderError> {
+        lazy_static! {
+            static ref CLUSTER_METADATA_MANIFEST_KEY: Regex =
+                Regex::new("cluster_metadata/([-a-f0-9]+)/manifests/([^]]+)/cluster_manifest.json")
+                    .unwrap();
+        }
+        if let Some(grps) = CLUSTER_METADATA_MANIFEST_KEY.captures(key) {
+            let cluster_uuid = grps.get(1).unwrap().as_str().to_string();
+            let meta_id_res = grps.get(2).unwrap().as_str().parse::<i64>();
+            let meta_id: i64;
+            let meta_id = if let Ok(id) = meta_id_res {
+                id
+            } else {
+                warn!("Malformed cluster metadata manifest metadata ID {}", key);
+                self.anomalies
+                    .malformed_cluster_manifests
+                    .push(key.to_string());
+                return Ok(());
+            };
+
+            let cluster_meta = self.cluster_metadata.entry(cluster_uuid).or_default();
+            let path = object_store::path::Path::from(key);
+            let body = self.client.get(&path).await?.bytes().await?;
+            if let Ok(manifest) = serde_json::from_slice::<ClusterMetadataManifest>(&body) {
+                cluster_meta.manifests.insert(meta_id, manifest);
+            } else {
+                warn!("Error parsing JSON cluster metadata manifest {}", key);
+                self.anomalies
+                    .malformed_cluster_manifests
+                    .push(key.to_string());
+            }
+        } else {
+            warn!("Malformed cluster metadata manifest key {}", key);
+            self.anomalies
+                .malformed_cluster_manifests
+                .push(key.to_string());
         }
         Ok(())
     }
