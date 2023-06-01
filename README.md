@@ -13,7 +13,7 @@ This tool is **not** for everyday use on live clusters.
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
     # Compile and run
-    cargo run --bin=rp-storage-tool --release -- --backend=<aws|gcp|azure> scan --source=<bucket name>
+    cargo run --release -- --backend=<aws|gcp|azure> scan --source=<bucket name>
 
 ## Installation
 
@@ -79,7 +79,7 @@ real cloud environments.
 For example, to use the tool with a bucket called `data` in a minio cluster at `aplite:9000`:
 
     AWS_ALLOW_HTTP=1 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
-      AWS_ENDPOINT=http://aplite:9000 cargo run --bin=rp-storage-tool --release -- --backend aws scan --source data
+      AWS_ENDPOINT=http://aplite:9000 cargo run --release -- --backend aws scan --source data
 
 ### Building a portable binary
 
