@@ -54,7 +54,21 @@ impl NTPFilter {
         if input == "*" || input == ".*" {
             Ok(None)
         } else {
-            Ok(Some(Regex::new(input)?))
+            // Ergonomic flourish:
+            // If a caller passes "kafka/foo/0", they probably didn't want
+            // to match topics like "blafooo" or "foo_v2": so if they didn't
+            // put ^$ bounds on their regex, add them.
+            let mut regex = if !input.starts_with("^") {
+                format!("^{}", input)
+            } else {
+                input.to_string()
+            };
+
+            if !regex.ends_with("$") {
+                regex = format!("{}$", regex);
+            }
+
+            Ok(Some(Regex::new(&regex)?))
         }
     }
 
