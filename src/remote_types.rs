@@ -867,7 +867,7 @@ impl TopicManifest {
 
 #[derive(Eq, PartialEq, Clone, Debug, Serialize_repr, Deserialize_repr)]
 #[repr(u8)]
-enum LifecycleStatus {
+pub enum LifecycleStatus {
     Live = 1,
     Purging = 2,
     Purged = 3,
@@ -875,7 +875,7 @@ enum LifecycleStatus {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct LifecycleMarker {
+pub struct LifecycleMarker {
     /// ID of the cluster that wrote this marker, in case multiple clusters
     // /// are addressing the same bucket
     // ss::sstring cluster_id;

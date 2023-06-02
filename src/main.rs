@@ -13,6 +13,7 @@ mod repair;
 mod varint;
 
 use log::{debug, error, info, trace, warn};
+use remote_types::RpSerde;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
@@ -23,7 +24,7 @@ use crate::error::BucketReaderError;
 use crate::fundamental::{raw_to_kafka, KafkaOffset, RaftTerm, RawOffset, NTPR, NTR};
 use crate::ntp_mask::NTPFilter;
 use crate::remote_types::{
-    segment_shortname, PartitionManifest, PartitionManifestSegment, TopicManifest,
+    segment_shortname, LifecycleMarker, PartitionManifest, PartitionManifestSegment, TopicManifest,
 };
 use crate::repair::{
     DataAddNullSegment, ManifestEditAlterSegment, ManifestSegmentDiff, RepairEdit,
@@ -103,6 +104,10 @@ enum Commands {
         meta_file: Option<String>,
     },
     DecodePartitionManifest {
+        #[arg(short, long)]
+        path: String,
+    },
+    DecodeLifecycleMarker {
         #[arg(short, long)]
         path: String,
     },
@@ -1061,6 +1066,15 @@ async fn decode_partition_manifest(path: &str) {
     serde_json::to_writer_pretty(&::std::io::stdout(), &manifest).unwrap();
 }
 
+async fn decode_lifecycle_marker(path: &str) {
+    let mut f = tokio::fs::File::open(path).await.unwrap();
+    let mut buf: Vec<u8> = vec![];
+    f.read_to_end(&mut buf).await.unwrap();
+    let mut cursor = std::io::Cursor::new(buf.as_slice());
+    let lm = LifecycleMarker::from_bytes(&mut cursor).unwrap();
+    serde_json::to_writer_pretty(&::std::io::stdout(), &lm).unwrap();
+}
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
@@ -1127,6 +1141,9 @@ async fn main() {
         }
         Some(Commands::DecodePartitionManifest { path }) => {
             decode_partition_manifest(path).await;
+        }
+        Some(Commands::DecodeLifecycleMarker { path }) => {
+            decode_lifecycle_marker(path).await;
         }
 
         None => {}
