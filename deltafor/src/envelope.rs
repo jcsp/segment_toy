@@ -1,5 +1,4 @@
 use std::io;
-use std::marker::PhantomData;
 
 pub struct SerdeEnvelope {
     pub version: u8,
@@ -19,7 +18,11 @@ impl SerdeEnvelope {
     fn read_impl(reader: &mut dyn io::Read) -> Result<(u8, u8, u32), io::Error> {
         let mut hdr: [u8; 6] = [0; 6];
         reader.read_exact(&mut hdr)?;
-        Ok((hdr[0], hdr[1], u32::from_le_bytes(hdr[2..6].try_into().unwrap())))
+        Ok((
+            hdr[0],
+            hdr[1],
+            u32::from_le_bytes(hdr[2..6].try_into().unwrap()),
+        ))
     }
 
     pub fn from(reader: &mut dyn io::Read) -> Result<Self, io::Error> {
@@ -40,29 +43,28 @@ impl SerdeEnvelope {
     }
 }
 
-
-pub struct SerdeEnvelopeContext<'a, T> {
+pub struct SerdeEnvelopeContext {
     pub envelope: SerdeEnvelope,
     start_position: u64,
-    phantom: PhantomData<&'a T>,
 }
 
 /// When decoding, it is useful to remember the cursor position where we started
 /// reading an envelope body, and later validate that we consumed the expected
 /// number of bytes.
-impl<'a, T: AsRef<[u8]>> SerdeEnvelopeContext<'a, T> {
-    pub fn from(my_version: u8, mut cursor: &mut std::io::Cursor<T>) -> Result<Self,
-        io::Error> {
+impl SerdeEnvelopeContext {
+    pub fn from(
+        my_version: u8,
+        mut cursor: &mut std::io::Cursor<&[u8]>,
+    ) -> Result<Self, io::Error> {
         let envelope = SerdeEnvelope::from(&mut cursor)?;
         assert!(envelope.compat_version <= my_version);
         Ok(SerdeEnvelopeContext {
             envelope,
             start_position: cursor.position(),
-            phantom: PhantomData,
         })
     }
 
-    pub fn end(&self, cursor: &std::io::Cursor<T>) {
+    pub fn end(&self, cursor: &std::io::Cursor<&[u8]>) {
         let expect_end = self.start_position + self.envelope.size as u64;
         if cursor.position() > expect_end {
             assert!(false, "Read too many bytes");

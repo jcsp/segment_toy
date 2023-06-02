@@ -1,6 +1,6 @@
 use crate::error::BucketReaderError;
 use crate::fundamental::{
-    raw_to_kafka, DeltaOffset, KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR,
+    raw_to_kafka, DeltaOffset, KafkaOffset, RaftTerm, RawOffset, Timestamp, NTP, NTPR, NTR,
 };
 use deltafor::envelope::{SerdeEnvelope, SerdeEnvelopeContext};
 use deltafor::{DeltaAlg, DeltaDelta, DeltaFORDecoder, DeltaXor};
@@ -8,6 +8,7 @@ use lazy_static::lazy_static;
 use log::warn;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_repr::{Deserialize_repr, Serialize_repr};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 use xxhash_rust::xxh32::xxh32;
@@ -195,7 +196,7 @@ pub fn decode_colstore(
     // gauge_col_t _archiver_term{};
     // gauge_col_t _segment_term{};
     // gauge_col_t _delta_offset_end{};
-    // gauge_col_t _sname_format{};
+    // gauge_col_t_sname_format{};
     // gauge_col_t _metadata_size_hint{};
 
     // gauge columns are int64_xor
@@ -450,12 +451,10 @@ fn offset_has_default_value(offset: &Option<i64>) -> bool {
 
 fn read_string(mut cursor: &mut dyn std::io::Read) -> Result<String, BucketReaderError> {
     let len = read_u32(&mut cursor)?;
-
     let mut bytes: Vec<u8> = vec![0; len as usize];
-    cursor.read_exact(bytes.as_mut_slice()).unwrap();
+    cursor.read_exact(bytes.as_mut_slice())?;
     Ok(String::from_utf8(bytes).unwrap())
 }
-
 fn read_u64(cursor: &mut dyn std::io::Read) -> Result<u64, BucketReaderError> {
     let mut raw: [u8; 8] = [0; 8];
     cursor.read_exact(&mut raw)?;
@@ -493,32 +492,52 @@ fn read_iobuf(mut cursor: &mut dyn std::io::Read) -> Result<Vec<u8>, BucketReade
     Ok(bytes)
 }
 
-pub struct DeltaFORStreamPos<'a, T> {
+fn decode_envelope<T, F>(
+    cursor: &mut std::io::Cursor<&[u8]>,
+    my_version: u8,
+    f: F,
+) -> Result<T, BucketReaderError>
+where
+    F: FnOnce(&SerdeEnvelopeContext, &mut std::io::Cursor<&[u8]>) -> Result<T, BucketReaderError>,
+{
+    let env = SerdeEnvelopeContext::from(my_version, cursor)?;
+    let result = f(&env, cursor);
+    if let Err(e) = result {
+        warn!(
+            "Envelope decode error at cursor position 0x{:08x} ({:?})",
+            cursor.position(),
+            e
+        );
+        Err(e)
+    } else {
+        env.end(cursor);
+        result
+    }
+}
+
+pub struct DeltaFORStreamPos {
     _initial: i64,
     _offset: u32,
     _num_rows: u32,
-    phantom: PhantomData<&'a T>,
 }
 
-impl<'a, T: AsRef<[u8]>> DeltaFORStreamPos<'a, T> {
-    pub fn from(mut cursor: &mut std::io::Cursor<T>) -> Result<Self, BucketReaderError> {
-        let envelope = SerdeEnvelopeContext::from(0, &mut cursor)?;
-
-        let initial = read_i64(&mut cursor)?;
-        let offset = read_u32(&mut cursor)?;
-        let num_rows = read_u32(&mut cursor)?;
-        envelope.end(&cursor);
-        Ok(Self {
-            _initial: initial,
-            _offset: offset,
-            _num_rows: num_rows,
-            phantom: PhantomData,
+impl DeltaFORStreamPos {
+    pub fn from(mut cursor: &mut std::io::Cursor<&[u8]>) -> Result<Self, BucketReaderError> {
+        decode_envelope(cursor, 0, |env, mut cursor| {
+            let initial = read_i64(&mut cursor)?;
+            let offset = read_u32(&mut cursor)?;
+            let num_rows = read_u32(&mut cursor)?;
+            Ok(Self {
+                _initial: initial,
+                _offset: offset,
+                _num_rows: num_rows,
+            })
         })
     }
 }
 
 pub trait RpSerde {
-    fn from_bytes(cursor: &mut dyn std::io::Read) -> Result<Self, BucketReaderError>
+    fn from_bytes(cursor: &mut std::io::Cursor<&[u8]>) -> Result<Self, BucketReaderError>
     where
         Self: Sized;
 }
@@ -535,7 +554,7 @@ pub struct LwSegment {
 }
 
 impl RpSerde for LwSegment {
-    fn from_bytes(mut cursor: &mut dyn std::io::Read) -> Result<Self, BucketReaderError> {
+    fn from_bytes(mut cursor: &mut std::io::Cursor<&[u8]>) -> Result<Self, BucketReaderError> {
         let _envelope = SerdeEnvelope::new().read(&mut cursor)?;
         let ntp_revision = read_u64(&mut cursor)?;
         let base_offset = read_i64(&mut cursor)?;
@@ -559,12 +578,14 @@ impl RpSerde for LwSegment {
     }
 }
 
-fn read_vec<T: RpSerde>(mut cursor: &mut dyn std::io::Read) -> Result<Vec<T>, BucketReaderError> {
+fn read_vec<T: RpSerde>(
+    mut cursor: &mut std::io::Cursor<&[u8]>,
+) -> Result<Vec<T>, BucketReaderError> {
     let len = read_u32(&mut cursor)?;
     let mut result: Vec<T> = vec![];
     result.reserve(len as usize);
     for _ in 0..len {
-        result.push(T::from_bytes(&mut cursor)?);
+        result.push(T::from_bytes(cursor)?);
     }
     Ok(result)
 }
@@ -638,7 +659,7 @@ impl PartitionManifest {
     }
 
     pub fn from_bytes(bytes: bytes::Bytes) -> Result<Self, BucketReaderError> {
-        let mut reader = std::io::Cursor::new(bytes);
+        let mut reader = std::io::Cursor::new(bytes.as_ref());
         let envelope = SerdeEnvelope::from(&mut reader)?;
 
         // model::ntp _ntp;
@@ -844,6 +865,72 @@ impl TopicManifest {
     }
 }
 
+#[derive(Eq, PartialEq, Clone, Debug, Serialize_repr, Deserialize_repr)]
+#[repr(u8)]
+enum LifecycleStatus {
+    Live = 1,
+    Purging = 2,
+    Purged = 3,
+    Offloaded = 4,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LifecycleMarker {
+    /// ID of the cluster that wrote this marker, in case multiple clusters
+    // /// are addressing the same bucket
+    // ss::sstring cluster_id;
+    //
+    // /// The unique identify of the topic-revision.  This will also be present
+    // /// in the object key, but including it in the body is convenient for
+    // /// readers.
+    // cluster::nt_revision topic;
+    //
+    // lifecycle_status status;
+    cluster_id: String,
+    ntr: NTR,
+    status: LifecycleStatus,
+}
+
+impl RpSerde for LifecycleMarker {
+    fn from_bytes(mut cursor: &mut std::io::Cursor<&[u8]>) -> Result<Self, BucketReaderError> {
+        decode_envelope(cursor, 0, |env, mut cursor| {
+            let cluster_id = read_string(&mut cursor)?;
+
+            let ntr = decode_envelope(cursor, 0, |env, mut cursor| {
+                let namespace = read_string(&mut cursor)?;
+                let topic = read_string(&mut cursor)?;
+                let revision_id = read_i64(&mut cursor)?;
+                Ok(NTR {
+                    namespace,
+                    topic,
+                    revision_id,
+                })
+            })?;
+
+            let status_raw = read_u32(&mut cursor)?;
+
+            let status = match status_raw {
+                1 => LifecycleStatus::Live,
+                2 => LifecycleStatus::Purging,
+                3 => LifecycleStatus::Purged,
+                4 => LifecycleStatus::Offloaded,
+                _ => {
+                    return Err(BucketReaderError::SyntaxError(format!(
+                        "Invalid lifecycle status {}",
+                        status_raw
+                    )))
+                }
+            };
+
+            Ok(Self {
+                cluster_id,
+                ntr,
+                status,
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1008,5 +1095,20 @@ mod tests {
 
         let json_manifest = serde_json::to_string(&manifest).unwrap();
         assert_eq!(json_manifest.find("last_uploaded_compacted_offset"), None);
+    }
+
+    #[test_log::test(tokio::test)]
+    async fn test_lifecycle_marker() {
+        let b = read_bytes("/resources/test/lifecycle_marker.bin").await;
+        let mut cursor = std::io::Cursor::new(b.as_ref());
+        let manifest = LifecycleMarker::from_bytes(&mut cursor).unwrap();
+        assert_eq!(
+            manifest.cluster_id,
+            "9687f8b0-b81a-4a4c-9811-883fed35c1d8".to_string()
+        );
+        assert_eq!(manifest.ntr.namespace, "kafka");
+        assert_eq!(manifest.ntr.topic, "testtopic");
+        assert_eq!(manifest.ntr.revision_id, 19);
+        assert_eq!(manifest.status, LifecycleStatus::Purged);
     }
 }
