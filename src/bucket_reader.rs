@@ -257,6 +257,10 @@ pub struct Anomalies {
     /// Ref Incident 259
     pub metadata_offset_gaps: HashMap<NTPR, Vec<MetadataGap>>,
 
+    /// Files referenced by the cluster manifest with the highest metadata ID which do not exist in
+    /// the bucket.
+    pub inconsistent_cluster_metadata: Vec<ClusterMetadata>,
+
     /// ClusterMetadataManifest that could not be loaded
     pub malformed_cluster_manifests: Vec<String>,
 
@@ -401,6 +405,7 @@ impl Anomalies {
             ntpr_bad_deltas: HashSet::new(),
             ntpr_overlap_offsets: HashSet::new(),
             metadata_offset_gaps: HashMap::new(),
+            inconsistent_cluster_metadata: vec![],
             malformed_cluster_manifests: vec![],
             malformed_controller_snapshot: vec![],
         }
@@ -435,6 +440,7 @@ impl PartitionMetadata {
         false
     }
 }
+
 
 async fn list_parallel<'a>(
     client: &'a dyn ObjectStore,
@@ -1065,6 +1071,41 @@ impl BucketReader {
                 filter,
                 object_meta.size as u64,
             )
+        }
+        debug!(
+            "Loaded metadata from {} clusters",
+            self.cluster_metadata.len()
+        );
+        for (cluster_uuid, meta) in &mut self.cluster_metadata {
+            debug!(
+                "Loaded {} cluster metadata manifests and {} controller snapshots from cluster {}",
+                meta.manifests.len(),
+                meta.controller_snapshots.len(),
+                cluster_uuid
+            );
+            let highest_manifest = if let Some((_, manifest)) =
+                meta.manifests.iter().max_by_key(|(_, m)| m.metadata_id)
+            {
+                manifest
+            } else {
+                debug!("No manifests for cluster {}", cluster_uuid);
+                continue;
+            };
+            if !highest_manifest.controller_snapshot_path.is_empty() {
+                continue;
+            }
+            if !meta
+                .controller_snapshots
+                .contains(&highest_manifest.controller_snapshot_path)
+            {
+                warn!(
+                    "Cluster {} manifest points at snapshot {} but it doesn't exist in bucket",
+                    cluster_uuid, highest_manifest.controller_snapshot_path
+                );
+                self.anomalies
+                    .inconsistent_cluster_metadata
+                    .push(meta.clone());
+            }
         }
         Ok(())
     }
